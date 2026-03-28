@@ -1,0 +1,355 @@
+import { create } from "zustand";
+import type {
+  Asset,
+  QuoteSnapshot,
+  SolveResponse,
+  GraphData,
+} from "../types";
+import { api } from "../api/client";
+
+interface EngineState {
+  // Data
+  universe: Asset[];
+  quotes: Record<string, QuoteSnapshot>;
+  solveResult: SolveResponse | null;
+  graphData: GraphData | null;
+
+  // UI state
+  selectedNode: string | null;
+  loading: boolean;
+  error: string | null;
+
+  // Hyperparameters
+  lambda: number;
+  eta: number;
+  shockNudges: Record<string, number>;
+  alphaOverrides: Record<string, number>;
+
+  // Observed/unobserved toggle and quote exclusion
+  observedTickers: string[];
+  excludedQuotes: Record<string, number[]>;
+  excludedPriorQuotes: Record<string, number[]>;
+  addedQuotes: Record<string, [number, number][]>;      // ticker -> [[strike, iv], ...]
+  addedPriorQuotes: Record<string, [number, number][]>; // ticker -> [[strike, iv], ...]
+
+  // Prior state
+  priorsCalibrated: boolean;
+  priorsVersion: number;  // incremented when priors change, forces Prior tab refresh
+
+  // Actions
+  fetchUniverse: () => Promise<void>;
+  fetchPriors: () => Promise<void>;
+  fetchSnapshot: () => Promise<void>;
+  fit: () => Promise<void>;       // lightweight: SVI for observed, prior for unobserved
+  propagate: () => Promise<void>;  // full: graph propagation (only via Propagate button)
+  fetchGraph: () => Promise<void>;
+  setSelectedNode: (ticker: string | null) => void;
+  setLambda: (v: number) => void;
+  setEta: (v: number) => void;
+  setShockNudge: (ticker: string, nudge: number) => void;
+  setAlphaOverride: (ticker: string, alpha: number) => void;
+  updateW: (W: number[][]) => Promise<void>;
+  toggleObserved: (ticker: string) => void;
+  toggleQuotePoint: (ticker: string, index: number) => void;
+  resetExclusions: (ticker: string) => void;
+  addQuotePoint: (ticker: string, strike: number, iv: number) => void;
+  removeAddedQuote: (ticker: string, index: number) => void;
+  resetAdditions: (ticker: string) => void;
+  togglePriorQuotePoint: (ticker: string, index: number) => void;
+  resetPriorExclusions: (ticker: string) => void;
+  addPriorQuotePoint: (ticker: string, strike: number, iv: number) => void;
+  removeAddedPriorQuote: (ticker: string, index: number) => void;
+  resetPriorAdditions: (ticker: string) => void;
+}
+
+let _propagateSeq = 0;
+
+export const useEngine = create<EngineState>((set, get) => ({
+  universe: [],
+  quotes: {},
+  solveResult: null,
+  graphData: null,
+  selectedNode: null,
+  loading: false,
+  error: null,
+  lambda: 1.0,
+  eta: 0.01,
+  shockNudges: {},
+  alphaOverrides: {},
+  observedTickers: [],
+  excludedQuotes: {},
+  excludedPriorQuotes: {},
+  addedQuotes: {},
+  addedPriorQuotes: {},
+  priorsCalibrated: false,
+  priorsVersion: 0,
+
+  fetchUniverse: async () => {
+    try {
+      const universe = await api.getUniverse();
+      set({ universe });
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
+
+  fetchPriors: async () => {
+    set({ loading: true, error: null });
+    try {
+      const quotes = await api.fetchQuotes();
+      set({
+        quotes,
+        observedTickers: Object.keys(quotes),
+        excludedQuotes: {},
+        excludedPriorQuotes: {},
+        solveResult: null,
+      });
+      await api.calibratePriors();
+      set({ priorsCalibrated: true, loading: false });
+    } catch (e: any) {
+      set({ error: e.message, loading: false });
+    }
+  },
+
+  fetchSnapshot: async () => {
+    set({ loading: true, error: null });
+    try {
+      const quotes = await api.fetchQuotes();
+      // Keep existing observedTickers if already set, otherwise default to all
+      const { observedTickers } = get();
+      const tickers = Object.keys(quotes);
+      const kept = observedTickers.length > 0
+        ? observedTickers.filter((t) => tickers.includes(t))
+        : tickers;
+      set({
+        quotes,
+        observedTickers: kept,
+        loading: false,
+      });
+      // Auto-fit (no propagation) with fresh quotes
+      await get().fit();
+    } catch (e: any) {
+      set({ error: e.message, loading: false });
+    }
+  },
+
+  fit: async () => {
+    const { observedTickers, excludedQuotes, addedQuotes } = get();
+    const seq = ++_propagateSeq;
+    set({ loading: true, error: null });
+    try {
+      const excl = Object.keys(excludedQuotes).length > 0 ? excludedQuotes : null;
+      const added = Object.keys(addedQuotes).length > 0 ? addedQuotes : null;
+      const result = await api.fit({
+        observed_tickers: observedTickers.length > 0 ? observedTickers : null,
+        excluded_quotes: excl,
+        added_quotes: added,
+      });
+      if (seq === _propagateSeq) {
+        // Build a minimal solveResult-like object for display
+        set({
+          solveResult: {
+            nodes: result.nodes,
+            W: get().solveResult?.W ?? [],
+            alphas: get().solveResult?.alphas ?? [],
+            tickers: result.tickers,
+            propagation_matrix: null,
+            neumann_terms: null,
+            influence_scores: null,
+            wasserstein_distances: null,
+          },
+          loading: false,
+        });
+      }
+    } catch (e: any) {
+      if (seq === _propagateSeq) {
+        set({ error: e.message, loading: false });
+      }
+    }
+  },
+
+  propagate: async () => {
+    const {
+      lambda, eta, shockNudges, alphaOverrides, graphData,
+      observedTickers, excludedQuotes, addedQuotes,
+    } = get();
+    const seq = ++_propagateSeq;
+    set({ loading: true, error: null });
+    try {
+      const excl = Object.keys(excludedQuotes).length > 0 ? excludedQuotes : null;
+      const added = Object.keys(addedQuotes).length > 0 ? addedQuotes : null;
+      const result = await api.solve({
+        lambda_: lambda,
+        eta: eta,
+        shock_nudges: Object.keys(shockNudges).length > 0 ? shockNudges : null,
+        alpha_overrides:
+          Object.keys(alphaOverrides).length > 0 ? alphaOverrides : null,
+        W_override: graphData?.W ?? null,
+        observed_tickers: observedTickers.length > 0 ? observedTickers : null,
+        excluded_quotes: excl,
+        added_quotes: added,
+      });
+      // Only apply if this is still the latest request
+      if (seq === _propagateSeq) {
+        set({ solveResult: result, loading: false });
+      }
+    } catch (e: any) {
+      if (seq === _propagateSeq) {
+        set({ error: e.message, loading: false });
+      }
+    }
+  },
+
+  fetchGraph: async () => {
+    try {
+      const graphData = await api.getGraph();
+      set({ graphData });
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
+
+  setSelectedNode: (ticker) => set({ selectedNode: ticker }),
+  setLambda: (v) => set({ lambda: v }),
+  setEta: (v) => set({ eta: v }),
+
+  setShockNudge: (ticker, nudge) =>
+    set((s) => ({
+      shockNudges: { ...s.shockNudges, [ticker]: nudge },
+    })),
+
+  setAlphaOverride: (ticker, alpha) =>
+    set((s) => ({
+      alphaOverrides: { ...s.alphaOverrides, [ticker]: alpha },
+    })),
+
+  updateW: async (W) => {
+    try {
+      await api.updateGraph(W);
+      set((s) => ({
+        graphData: s.graphData ? { ...s.graphData, W } : null,
+      }));
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
+
+  toggleObserved: (ticker) => {
+    set((s) => {
+      const isObs = s.observedTickers.includes(ticker);
+      return {
+        observedTickers: isObs
+          ? s.observedTickers.filter((t) => t !== ticker)
+          : [...s.observedTickers, ticker],
+      };
+    });
+    if (Object.keys(get().quotes).length > 0) {
+      get().fit();
+    }
+  },
+
+  toggleQuotePoint: (ticker, index) => {
+    set((s) => {
+      const current = s.excludedQuotes[ticker] ?? [];
+      const isExcluded = current.includes(index);
+      const next = isExcluded
+        ? current.filter((i) => i !== index)
+        : [...current, index];
+      return {
+        excludedQuotes: {
+          ...s.excludedQuotes,
+          [ticker]: next,
+        },
+      };
+    });
+    // Re-propagate with updated exclusions
+    get().fit();
+  },
+
+  resetExclusions: (ticker) => {
+    set((s) => {
+      const { [ticker]: _, ...rest } = s.excludedQuotes;
+      return { excludedQuotes: rest };
+    });
+    get().fit();
+  },
+
+  togglePriorQuotePoint: (ticker, index) =>
+    set((s) => {
+      const current = s.excludedPriorQuotes[ticker] ?? [];
+      const isExcluded = current.includes(index);
+      return {
+        excludedPriorQuotes: {
+          ...s.excludedPriorQuotes,
+          [ticker]: isExcluded
+            ? current.filter((i) => i !== index)
+            : [...current, index],
+        },
+      };
+    }),
+
+  addQuotePoint: (ticker, strike, iv) => {
+    set((s) => ({
+      addedQuotes: {
+        ...s.addedQuotes,
+        [ticker]: [...(s.addedQuotes[ticker] ?? []), [strike, iv]],
+      },
+    }));
+    get().fit();
+  },
+
+  removeAddedQuote: (ticker, index) => {
+    set((s) => {
+      const current = s.addedQuotes[ticker] ?? [];
+      return {
+        addedQuotes: {
+          ...s.addedQuotes,
+          [ticker]: current.filter((_, i) => i !== index),
+        },
+      };
+    });
+    get().fit();
+  },
+
+  resetAdditions: (ticker) => {
+    set((s) => {
+      const { [ticker]: _, ...rest } = s.addedQuotes;
+      return { addedQuotes: rest };
+    });
+    get().fit();
+  },
+
+  resetPriorExclusions: (ticker) =>
+    set((s) => {
+      const { [ticker]: _, ...rest } = s.excludedPriorQuotes;
+      return { excludedPriorQuotes: rest };
+    }),
+
+  addPriorQuotePoint: (ticker, strike, iv) => {
+    set((s) => ({
+      addedPriorQuotes: {
+        ...s.addedPriorQuotes,
+        [ticker]: [...(s.addedPriorQuotes[ticker] ?? []), [strike, iv]],
+      },
+    }));
+  },
+
+  removeAddedPriorQuote: (ticker, index) => {
+    set((s) => {
+      const current = s.addedPriorQuotes[ticker] ?? [];
+      return {
+        addedPriorQuotes: {
+          ...s.addedPriorQuotes,
+          [ticker]: current.filter((_, i) => i !== index),
+        },
+      };
+    });
+  },
+
+  resetPriorAdditions: (ticker) => {
+    set((s) => {
+      const { [ticker]: _, ...rest } = s.addedPriorQuotes;
+      return { addedPriorQuotes: rest };
+    });
+  },
+}));
