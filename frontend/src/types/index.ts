@@ -21,6 +21,11 @@ export interface QuoteSnapshot {
   prev_close_ivs: number[] | null;
   prev_close_atm_iv: number | null;
   prev_spot: number | null;
+  forward_parity: number | null;
+  forward_model: number | null;
+  rate_used: number | null;
+  div_yield_used: number | null;
+  repo_rate_used: number | null;
 }
 
 export interface SmileData {
@@ -79,4 +84,15 @@ export interface NodeDistributionResponse {
   ticker: string;
   is_observed: boolean;
   wasserstein_dist: number;
+}
+
+export interface RatesConfig {
+  repo_rate_gc: number;
+  repo_overrides: Record<string, number>;
+}
+
+export interface TreasuryCurveData {
+  date: string;
+  tenors: number[];
+  rates: number[];
 }

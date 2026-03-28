@@ -82,7 +82,8 @@ def save_prior(
         orig_ivs = chain.prev_close_ivs if chain.prev_close_ivs is not None else chain.mid_ivs
         prev_spot = chain.prev_spot or chain.spot
         T = chain.T
-        forward = prev_spot * np.exp(0.045 * T)  # approximate
+        rate = getattr(chain, 'rate_used', 0.045)
+        forward = prev_spot * np.exp(rate * T)
     else:
         orig_strikes = prior_dict.get("_fit_strikes", np.array([]))
         orig_ivs = np.array(svi_params.get("iv_fitted", [])) if svi_params else np.array([])
@@ -110,6 +111,7 @@ def save_prior(
         "atm_iv": atm_iv,
         "forward": forward,
         "T": T,
+        "rate_used": float(getattr(chain, 'rate_used', 0.045)) if chain is not None else 0.045,
         "bs_m": float(prior_dict.get("m", 0.0)),
         "bs_s": float(prior_dict.get("s", 0.0)),
     }
@@ -152,6 +154,7 @@ def load_prior(ticker: str) -> dict:
 
     T = data.get("T", 30.0 / 365.0)
     forward = data.get("forward", 100.0)
+    rate_used = data.get("rate_used", 0.045)
     strikes = np.array(data.get("strikes", []), dtype=float)
     ivs = np.array(data.get("ivs", []), dtype=float)
     excluded = data.get("excluded_indices", [])
@@ -186,7 +189,7 @@ def load_prior(ticker: str) -> dict:
             try:
                 prior = fit_lqd_prior(
                     eff_strikes, eff_ivs, forward, T,
-                    cfg.risk_free_rate, grid, phi,
+                    rate_used, grid, phi,
                 )
                 prior["_fit_strikes"] = strikes  # keep original full set for reference
                 return prior

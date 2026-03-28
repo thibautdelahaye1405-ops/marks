@@ -25,6 +25,8 @@ from ..engine.lqd import quantile_grid, basis_functions
 from ..engine.prior import bs_prior, fit_lqd_prior, apply_beta_overrides, compute_distribution_view
 from ..engine.graph import build_influence_matrix
 from ..engine.pipeline import run_marking, NodeQuotes
+from ..data.rates import fetch_treasury_curve
+from ..data.dividends import fetch_dividend_info
 
 router = APIRouter(prefix="/api")
 
@@ -40,6 +42,11 @@ def _chain_to_snapshot(c) -> QuoteSnapshot:
         prev_close_ivs=c.prev_close_ivs.tolist() if c.prev_close_ivs is not None else None,
         prev_close_atm_iv=c.prev_close_atm_iv,
         prev_spot=c.prev_spot,
+        forward_parity=getattr(c, 'forward_parity', None),
+        forward_model=getattr(c, 'forward_model', None),
+        rate_used=getattr(c, 'rate_used', None),
+        div_yield_used=getattr(c, 'div_yield_used', None),
+        repo_rate_used=getattr(c, 'repo_rate_used', None),
     )
 
 # In-memory state for the current session
@@ -51,7 +58,67 @@ _state = {
     "priors_base": {},  # ticker -> immutable base prior (from calibrate-priors or fit)
     "priors": {},       # ticker -> active prior (base + overrides, used by solve)
     "solve_result": None,  # last MarkingResult for distribution views
+    "treasury_curve": None,  # TreasuryCurve from FRED
+    "dividends": {},         # ticker -> DividendInfo
+    "forward_overrides": {},       # ticker -> absolute forward override (current smile)
+    "prev_forward_overrides": {},   # ticker -> absolute forward override (prior)
 }
+
+
+def _get_rate_func():
+    """Return a rate function: either Treasury curve interpolation or flat override."""
+    config = _state["config"]
+    if config.risk_free_rate is not None:
+        flat_r = config.risk_free_rate
+        return lambda T: flat_r
+    curve = _state.get("treasury_curve")
+    if curve is None:
+        curve = fetch_treasury_curve()
+        _state["treasury_curve"] = curve
+    return curve.rate_at
+
+
+def _get_rate(T: float) -> float:
+    """Get rate for a specific maturity."""
+    return _get_rate_func()(T)
+
+
+def _compute_forward(spot, T, ticker):
+    """Compute forward with full formula: S*exp((r-q-repo)*T) - PV(divs)."""
+    import math
+    config = _state["config"]
+    r = _get_rate(T)
+    div_info = _state.get("dividends", {}).get(ticker)
+    q = div_info.continuous_yield if div_info else 0.0
+    repo = config.repo_rate_for(ticker)
+    pv_divs = 0.0
+    if div_info and div_info.discrete_dividends and not div_info.is_index:
+        from ..data.dividends import pv_discrete_dividends
+        from datetime import datetime
+        pv_divs = pv_discrete_dividends(
+            div_info.discrete_dividends, _get_rate_func(), datetime.now()
+        )
+    return spot * math.exp((r - q - repo) * T) - pv_divs
+
+
+def _effective_forward(ticker: str) -> float:
+    """Return the forward to use: user override if set, else chain.forward."""
+    ovr = _state["forward_overrides"].get(ticker)
+    if ovr is not None:
+        return ovr
+    chain = _state["quotes"].get(ticker)
+    return chain.forward if chain else 100.0
+
+
+def _effective_prev_forward(ticker: str) -> float:
+    """Return the prior forward: user override if set, else model from prev_spot."""
+    ovr = _state["prev_forward_overrides"].get(ticker)
+    if ovr is not None:
+        return ovr
+    chain = _state["quotes"].get(ticker)
+    if chain is None:
+        return 100.0
+    return _compute_forward(chain.prev_spot or chain.spot, chain.T, ticker)
 
 
 @router.get("/universe", response_model=list[Asset])
@@ -72,13 +139,27 @@ def fetch_quotes_endpoint():
     """Fetch fresh option chains from Yahoo Finance for the entire universe."""
     universe = get_universe()
     config = _state["config"]
-    results = {}
 
+    # Fetch Treasury curve
+    curve = fetch_treasury_curve()
+    _state["treasury_curve"] = curve
+    rate_func = _get_rate_func()
+
+    # Fetch dividend info for all tickers
+    asset_map = {a.ticker: a for a in universe}
+    dividends = {}
+    for asset in universe:
+        dividends[asset.ticker] = fetch_dividend_info(asset.ticker, is_index=asset.is_index)
+    _state["dividends"] = dividends
+
+    results = {}
     for asset in universe:
         chain = fetch_option_chain(
             asset.ticker,
             target_maturity_days=config.target_maturity_days,
-            r=config.risk_free_rate,
+            rate_func=rate_func,
+            dividend_info=dividends.get(asset.ticker),
+            repo_rate=config.repo_rate_for(asset.ticker),
         )
         if chain is not None:
             _state["quotes"][asset.ticker] = chain
@@ -235,15 +316,15 @@ def solve_endpoint(req: SolveRequest):
         for ticker, chain in _state["quotes"].items():
             try:
                 if chain.prev_close_ivs is not None and chain.prev_spot is not None:
-                    prev_forward = chain.prev_spot * np.exp(config.risk_free_rate * chain.T)
+                    prev_forward = _effective_prev_forward(ticker)
                     priors[ticker] = fit_lqd_prior(
                         chain.strikes, chain.prev_close_ivs, prev_forward,
-                        chain.T, config.risk_free_rate, grid, phi,
+                        chain.T, _get_rate(chain.T), grid, phi,
                     )
                 else:
                     priors[ticker] = fit_lqd_prior(
                         chain.strikes, chain.mid_ivs, chain.forward,
-                        chain.T, config.risk_free_rate, grid, phi,
+                        chain.T, _get_rate(chain.T), grid, phi,
                     )
             except Exception:
                 priors[ticker] = bs_prior(chain.atm_iv, chain.T, grid)
@@ -435,20 +516,20 @@ def calibrate_priors():
         try:
             # Use previous close IVs if available
             if chain.prev_close_ivs is not None and chain.prev_spot is not None:
-                prev_forward = chain.prev_spot * np.exp(config.risk_free_rate * chain.T)
+                prev_forward = _effective_prev_forward(ticker)
                 prior = fit_lqd_prior(
                     strikes=chain.strikes,
                     mid_ivs=chain.prev_close_ivs,
                     forward=prev_forward,
                     T=chain.T,
-                    r=config.risk_free_rate,
+                    r=_get_rate(chain.T),
                     grid=grid, phi=phi,
                 )
             else:
                 # Fallback: use current IVs
                 prior = fit_lqd_prior(
                     strikes=chain.strikes, mid_ivs=chain.mid_ivs,
-                    forward=chain.forward, T=chain.T, r=config.risk_free_rate,
+                    forward=chain.forward, T=chain.T, r=_get_rate(chain.T),
                     grid=grid, phi=phi,
                 )
             priors[ticker] = prior
@@ -481,7 +562,7 @@ def get_prior(ticker: str):
     forward = chain.forward if chain else 100.0
     T = chain.T if chain else 30 / 365
 
-    view = compute_distribution_view(prior, grid, forward, T, config.risk_free_rate, phi=phi, market_strikes=chain.strikes if chain else None)
+    view = compute_distribution_view(prior, grid, forward, T, _get_rate(T), phi=phi, market_strikes=chain.strikes if chain else None)
 
     # Return SVI params as "beta" for the slider UI
     svi = prior.get("_svi_params")
@@ -532,7 +613,7 @@ def override_prior(ticker: str, req: PriorOverrideRequest):
     # If all zeros, just restore the base prior
     if np.all(np.abs(beta_adj) < 1e-12):
         _state["priors"][ticker] = base_prior
-        view = compute_distribution_view(base_prior, grid, forward, T, config.risk_free_rate, phi=phi, market_strikes=chain.strikes if chain else None)
+        view = compute_distribution_view(base_prior, grid, forward, T, _get_rate(T), phi=phi, market_strikes=chain.strikes if chain else None)
         base_beta = base_prior.get("beta_fit", [0.0] * config.M)
         if hasattr(base_beta, "tolist"):
             base_beta = base_beta.tolist()
@@ -544,14 +625,14 @@ def override_prior(ticker: str, req: PriorOverrideRequest):
         )
 
     updated = apply_beta_overrides(
-        base_prior, beta_adj, phi, grid, forward, T, config.risk_free_rate,
+        base_prior, beta_adj, phi, grid, forward, T, _get_rate(T),
         forward * np.exp(np.linspace(-0.3, 0.3, 50)),
     )
 
     # Store the overridden prior for solve (but never touch priors_base)
     _state["priors"][ticker] = updated
 
-    view = compute_distribution_view(updated, grid, forward, T, config.risk_free_rate, phi=phi, market_strikes=chain.strikes if chain else None)
+    view = compute_distribution_view(updated, grid, forward, T, _get_rate(T), phi=phi, market_strikes=chain.strikes if chain else None)
 
     return DistributionView(
         moneyness=view["moneyness"], iv_curve=view["iv_curve"],
@@ -598,7 +679,7 @@ def svi_override_prior(ticker: str, req: SviOverrideRequest):
 
     _state["priors"][ticker] = updated
 
-    view = compute_distribution_view(updated, grid, forward, T, config.risk_free_rate, phi=phi,
+    view = compute_distribution_view(updated, grid, forward, T, _get_rate(T), phi=phi,
                                      market_strikes=chain.strikes if chain else None)
     return DistributionView(
         moneyness=view["moneyness"], iv_curve=view["iv_curve"],
@@ -681,12 +762,12 @@ def refit_prior(ticker: str, req: PriorRefitRequest):
     if len(strikes) < 3:
         raise HTTPException(status_code=400, detail="Too few quotes remaining after exclusion")
 
-    prev_forward = (chain.prev_spot or chain.spot) * np.exp(config.risk_free_rate * chain.T)
+    prev_forward = _effective_prev_forward(ticker)
 
     try:
         prior = fit_lqd_prior(
             strikes=strikes, mid_ivs=prev_ivs,
-            forward=prev_forward, T=chain.T, r=config.risk_free_rate,
+            forward=prev_forward, T=chain.T, r=_get_rate(chain.T),
             grid=grid, phi=phi,
         )
     except Exception:
@@ -697,10 +778,15 @@ def refit_prior(ticker: str, req: PriorRefitRequest):
     _state["priors"][ticker] = prior
 
     forward = chain.forward
-    view = compute_distribution_view(prior, grid, forward, chain.T, config.risk_free_rate, phi=phi, market_strikes=chain.strikes if chain else None)
-    beta_fit = prior.get("beta_fit", [0.0] * config.M)
-    if hasattr(beta_fit, "tolist"):
-        beta_fit = beta_fit.tolist()
+    view = compute_distribution_view(prior, grid, forward, chain.T, _get_rate(chain.T), phi=phi, market_strikes=chain.strikes if chain else None)
+
+    # Return SVI params (not LQD beta_fit) so the frontend sliders work
+    svi = prior.get("_svi_params")
+    if svi:
+        beta = [svi.get("a", 0), svi.get("b", 0), svi.get("rho", 0),
+                svi.get("m", 0), svi.get("sigma", 0.1)]
+    else:
+        beta = [0.0] * 5
 
     return DistributionView(
         moneyness=view["moneyness"],
@@ -709,7 +795,7 @@ def refit_prior(ticker: str, req: PriorRefitRequest):
         cdf_y=view["cdf_y"],
         lqd_u=view["lqd_u"],
         lqd_psi=view["lqd_psi"], fit_forward=view.get("fit_forward"),
-        beta=beta_fit,
+        beta=beta,
     )
 
 
@@ -734,7 +820,7 @@ def get_node_distribution(ticker: str):
     forward = chain.forward if chain else 100.0
     T = chain.T if chain else 30 / 365
 
-    prior_view = compute_distribution_view(prior, grid, forward, T, config.risk_free_rate, phi=phi, market_strikes=chain.strikes if chain else None)
+    prior_view = compute_distribution_view(prior, grid, forward, T, _get_rate(T), phi=phi, market_strikes=chain.strikes if chain else None)
     prior_beta = prior.get("beta_fit", [0.0] * config.M)
     if hasattr(prior_beta, "tolist"):
         prior_beta = prior_beta.tolist()
@@ -749,7 +835,7 @@ def get_node_distribution(ticker: str):
         beta=prior_beta,
     )
 
-    # Marked view (if solve has been run)
+    # Marked view (from solve result, or fallback to direct SVI fit from quotes)
     marked_dv = None
     is_observed = True
     w2_dist = 0.0
@@ -776,7 +862,7 @@ def get_node_distribution(ticker: str):
                     "_svi_params": market_svi,
                 }
                 marked_view = compute_distribution_view(
-                    marked_prior, grid, forward, T, config.risk_free_rate,
+                    marked_prior, grid, forward, T, _get_rate(T),
                     phi=phi, market_strikes=chain.strikes if chain else None,
                 )
                 marked_dv = DistributionView(
@@ -803,7 +889,7 @@ def get_node_distribution(ticker: str):
 
             marked_view = compute_distribution_view(
                 {**marked_dict, "psi0": psi_marked},
-                grid, forward, T, config.risk_free_rate, phi=phi,
+                grid, forward, T, _get_rate(T), phi=phi,
                 market_strikes=chain.strikes if chain else None,
             )
             marked_dv = DistributionView(
@@ -815,6 +901,34 @@ def get_node_distribution(ticker: str):
                 lqd_psi=marked_view["lqd_psi"],
                 beta=nr.beta.tolist(),
             )
+
+    # Fallback: if no solve result yet but we have quotes, build marked view
+    # from a direct SVI fit to current market data
+    if marked_dv is None and chain is not None:
+        from ..engine.svi import fit_svi, filter_quotes_for_fit
+        filt_k, filt_iv, _ = filter_quotes_for_fit(chain.strikes, chain.mid_ivs, chain.forward)
+        if len(filt_k) >= 5:
+            try:
+                market_svi = fit_svi(filt_k, filt_iv, chain.forward, T)
+                marked_prior = {**prior, "_svi_params": market_svi}
+                marked_view = compute_distribution_view(
+                    marked_prior, grid, forward, T, _get_rate(T),
+                    phi=phi, market_strikes=chain.strikes,
+                )
+                svi_beta = [market_svi.get("a", 0), market_svi.get("b", 0),
+                            market_svi.get("rho", 0), market_svi.get("m", 0),
+                            market_svi.get("sigma", 0.1)]
+                marked_dv = DistributionView(
+                    moneyness=marked_view["moneyness"],
+                    iv_curve=marked_view["iv_curve"],
+                    cdf_x=marked_view["cdf_x"],
+                    cdf_y=marked_view["cdf_y"],
+                    lqd_u=marked_view["lqd_u"],
+                    lqd_psi=marked_view["lqd_psi"],
+                    beta=svi_beta,
+                )
+            except Exception:
+                pass
 
     return NodeDistributionResponse(
         prior=prior_dv,
@@ -889,7 +1003,7 @@ def load_prior_endpoint(ticker: str):
         chain.strikes = saved_strikes
         chain.prev_close_ivs = saved_ivs
         chain.mid_ivs = saved_ivs  # also update mid so Smile tab is consistent
-        chain.prev_spot = saved_forward / np.exp(0.045 * saved_T)
+        chain.prev_spot = saved_forward / np.exp(_get_rate(saved_T) * saved_T)
         chain.prev_close_atm_iv = float(saved_ivs[np.argmin(np.abs(saved_strikes - saved_forward))])
         # Update bid-ask spreads for the new strike count
         chain.bid_ask_spread = np.full(len(saved_strikes), 0.02)
@@ -917,3 +1031,84 @@ def load_prior_endpoint(ticker: str):
         "added_quotes": added_quotes,
         "chain_snapshot": chain_snapshot.dict() if chain_snapshot else None,
     }
+
+
+# --- Rates & Forwards ---
+
+@router.get("/rates/treasury")
+def get_treasury_curve():
+    curve = _state.get("treasury_curve")
+    if curve is None:
+        curve = fetch_treasury_curve()
+        _state["treasury_curve"] = curve
+    return {
+        "date": curve.date,
+        "tenors": curve.tenors.tolist(),
+        "rates": curve.rates.tolist(),
+    }
+
+
+@router.get("/rates/config")
+def get_rates_config():
+    config = _state["config"]
+    return {
+        "repo_rate_gc": config.repo_rate_gc,
+        "repo_overrides": config.repo_overrides,
+    }
+
+
+@router.put("/rates/config")
+def update_rates_config(req: dict):
+    config = _state["config"]
+    if "repo_rate_gc" in req:
+        config.repo_rate_gc = float(req["repo_rate_gc"])
+    if "repo_overrides" in req:
+        config.repo_overrides = {k: float(v) for k, v in req["repo_overrides"].items()}
+    return {"status": "ok"}
+
+
+@router.put("/forward/{ticker}")
+def set_forward_override(ticker: str, req: dict):
+    """Set or clear a forward override for current smile.
+
+    Body: {"forward": 635.5} to override, or {"forward": null} to clear.
+    """
+    chain = _state["quotes"].get(ticker)
+    if chain is None:
+        raise HTTPException(status_code=404, detail=f"No quotes for {ticker}")
+
+    fwd_val = req.get("forward")
+    if fwd_val is None:
+        _state["forward_overrides"].pop(ticker, None)
+        chain.forward = chain.forward_model or chain.forward
+    else:
+        fwd_val = float(fwd_val)
+        _state["forward_overrides"][ticker] = fwd_val
+        chain.forward = fwd_val
+
+    return {
+        "status": "ok",
+        "ticker": ticker,
+        "forward": chain.forward,
+        "forward_model": chain.forward_model,
+        "forward_parity": chain.forward_parity,
+    }
+
+
+@router.put("/forward/{ticker}/prior")
+def set_prior_forward_override(ticker: str, req: dict):
+    """Set or clear a forward override for the prior (prev close).
+
+    Body: {"forward": 630.0} to override, or {"forward": null} to clear.
+    """
+    chain = _state["quotes"].get(ticker)
+    if chain is None:
+        raise HTTPException(status_code=404, detail=f"No quotes for {ticker}")
+
+    fwd_val = req.get("forward")
+    if fwd_val is None:
+        _state["prev_forward_overrides"].pop(ticker, None)
+    else:
+        _state["prev_forward_overrides"][ticker] = float(fwd_val)
+
+    return {"status": "ok", "ticker": ticker}

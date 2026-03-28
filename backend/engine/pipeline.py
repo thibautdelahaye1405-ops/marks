@@ -150,7 +150,7 @@ def run_marking(
             s_v=bs_base["s"],
             forward=q.forward,
             T=q.T,
-            r=config.risk_free_rate,
+            r=config.risk_free_rate or 0.045,
             strikes=q.strikes,
             sigma_prior=bs_base["s"] / np.sqrt(max(q.T, 1e-6)),
             phi=phi,
@@ -164,8 +164,8 @@ def run_marking(
             iv_cal_prior = svi_iv_at_strikes(svi_params, q.strikes, q.forward, q.T)
         else:
             iv_bs = call_price_to_iv(
-                quantile_to_call_prices(bs_base["Q"], grid, q.forward, q.T, config.risk_free_rate, q.strikes),
-                q.forward, q.strikes, q.T, config.risk_free_rate,
+                quantile_to_call_prices(bs_base["Q"], grid, q.forward, q.T, config.risk_free_rate or 0.045, q.strikes),
+                q.forward, q.strikes, q.T, config.risk_free_rate or 0.045,
             )
             iv_cal_prior = iv_bs + A_v @ beta_fit
 
@@ -331,8 +331,8 @@ def run_marking(
             iv_prior_fitted = svi_iv_at_strikes(svi_params, strikes, forward, T)
         else:
             iv_prior_fitted = call_price_to_iv(
-                quantile_to_call_prices(bs_base["Q"], grid, forward, T, config.risk_free_rate, strikes),
-                forward, strikes, T, config.risk_free_rate,
+                quantile_to_call_prices(bs_base["Q"], grid, forward, T, config.risk_free_rate or 0.045, strikes),
+                forward, strikes, T, config.risk_free_rate or 0.045,
             )
         iv_prior_fitted = np.clip(iv_prior_fitted, 0.01, 5.0)
 

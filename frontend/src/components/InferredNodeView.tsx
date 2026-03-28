@@ -115,16 +115,32 @@ export default function InferredNodeView({ ticker }: Props) {
             paper_bgcolor: "#1e293b",
             plot_bgcolor: "#1e293b",
             font: { color: "#94a3b8" },
-            shapes: quoteData ? [{
-              type: "line", x0: quoteData.forward, x1: quoteData.forward,
-              y0: 0, y1: 1, yref: "paper",
-              line: { color: "#f59e0b", width: 1, dash: "dot" },
-            }] : [],
-            annotations: quoteData ? [{
-              x: quoteData.forward, y: 1.02, yref: "paper",
-              text: `F=${quoteData.forward.toFixed(0)}`,
-              showarrow: false, font: { color: "#f59e0b", size: 9 },
-            }] : [],
+            shapes: quoteData ? [
+              // Model forward line
+              {
+                type: "line", x0: quoteData.forward, x1: quoteData.forward,
+                y0: 0, y1: 1, yref: "paper",
+                line: { color: "#f59e0b", width: 1, dash: "dot" },
+              },
+              // Parity forward (reference)
+              ...(quoteData.forward_parity != null ? [{
+                type: "line" as const, x0: quoteData.forward_parity, x1: quoteData.forward_parity,
+                y0: 0, y1: 1, yref: "paper" as const,
+                line: { color: "#94a3b8", width: 1, dash: "dash" as const },
+              }] : []),
+            ] : [],
+            annotations: quoteData ? [
+              {
+                x: quoteData.forward, y: 1.02, yref: "paper",
+                text: `F=${quoteData.forward.toFixed(1)}`,
+                showarrow: false, font: { color: "#f59e0b", size: 9 },
+              },
+              ...(quoteData.forward_parity != null ? [{
+                x: quoteData.forward_parity, y: 0.96, yref: "paper" as const,
+                text: `F(parity)=${quoteData.forward_parity.toFixed(1)}`,
+                showarrow: false, font: { color: "#94a3b8", size: 8 },
+              }] : []),
+            ] : [],
             xaxis: { title: "Strike", gridcolor: "#334155", zerolinecolor: "#334155" },
             yaxis: { title: "Implied Vol (%)", gridcolor: "#334155", zerolinecolor: "#334155" },
             legend: { x: 1, y: 1, xanchor: "right", bgcolor: "rgba(0,0,0,0)", font: { size: 9 } },

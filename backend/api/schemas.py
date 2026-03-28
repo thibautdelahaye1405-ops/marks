@@ -28,6 +28,11 @@ class QuoteSnapshot(BaseModel):
     prev_close_ivs: Optional[List[float]] = None
     prev_close_atm_iv: Optional[float] = None
     prev_spot: Optional[float] = None
+    forward_parity: Optional[float] = None
+    forward_model: Optional[float] = None
+    rate_used: Optional[float] = None
+    div_yield_used: Optional[float] = None
+    repo_rate_used: Optional[float] = None
 
 
 class SmileData(BaseModel):
@@ -129,3 +134,13 @@ class NodeDistributionResponse(BaseModel):
     ticker: str
     is_observed: bool
     wasserstein_dist: float = 0.0
+
+
+class RatesConfig(BaseModel):
+    repo_rate_gc: float = 0.0
+    repo_overrides: Dict[str, float] = {}
+
+class TreasuryCurveResponse(BaseModel):
+    date: str
+    tenors: List[float]
+    rates: List[float]

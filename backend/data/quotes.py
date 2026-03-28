@@ -33,6 +33,12 @@ class OptionChainData:
     prev_close_ivs: Optional[np.ndarray] = None   # IVs from prev close prices
     prev_close_atm_iv: Optional[float] = None      # ATM IV from prev close
     prev_spot: Optional[float] = None               # previous day's spot price
+    forward_parity: Optional[float] = None     # put-call parity implied forward
+    forward_model: Optional[float] = None      # model forward: S*exp((r-q-repo)*T) - PV(divs)
+    rate_used: float = 0.045                   # interpolated Treasury rate
+    div_yield_used: float = 0.0                # continuous dividend yield
+    repo_rate_used: float = 0.0                # repo rate used
+    put_mids: Optional[np.ndarray] = None      # put mid prices
 
 
 def _bs_call_price(F, K, T, r, sigma):
@@ -55,12 +61,57 @@ def _price_to_iv(price, F, K, T, r):
         return None
 
 
+def _bs_put_price(F, K, T, r, sigma):
+    """Black-Scholes put price from forward."""
+    if sigma < 1e-10 or T < 1e-10:
+        return max(np.exp(-r * T) * (K - F), 0.0)
+    d1 = (np.log(F / K) + 0.5 * sigma ** 2 * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return np.exp(-r * T) * (K * norm_dist.cdf(-d2) - F * norm_dist.cdf(-d1))
+
+
+def _price_to_iv_put(price, F, K, T, r):
+    """Invert a single put price to implied vol."""
+    intrinsic = max(np.exp(-r * T) * (K - F), 0.0)
+    if price <= intrinsic + 1e-8:
+        return None
+    try:
+        return brentq(lambda s: _bs_put_price(F, K, T, r, s) - price, 0.01, 5.0, xtol=1e-6)
+    except (ValueError, RuntimeError):
+        return None
+
+
+def _compute_parity_forward(call_prices, put_prices, strikes, r, T):
+    """Compute market-implied forward from put-call parity.
+
+    F = K* + exp(rT) * (C(K*) - P(K*)) where K* minimises |C-P|.
+    Returns (forward, K_star) or (None, None) if insufficient data.
+    """
+    valid = (call_prices > 0.01) & (put_prices > 0.01)
+    if valid.sum() < 3:
+        return None, None
+
+    c = call_prices[valid]
+    p = put_prices[valid]
+    k = strikes[valid]
+
+    diff = np.abs(c - p)
+    best_idx = np.argmin(diff)
+    k_star = k[best_idx]
+    forward = k_star + np.exp(r * T) * (c[best_idx] - p[best_idx])
+
+    return float(forward), float(k_star)
+
+
 def fetch_option_chain(
     ticker: str,
     target_maturity_days: int = 30,
     min_oi: int = 10,
     max_strikes: int = 30,
     r: float = 0.045,
+    rate_func=None,        # Callable[[float], float] for Treasury curve
+    dividend_info=None,    # DividendInfo from dividends module
+    repo_rate: float = 0.0,
 ) -> Optional[OptionChainData]:
     """
     Fetch option chain from Yahoo Finance for the expiry closest to target maturity.
@@ -93,10 +144,69 @@ def fetch_option_chain(
 
         exp_date = datetime.strptime(best_exp, "%Y-%m-%d")
         T = max((exp_date - datetime.now()).days / 365.0, 1 / 365.0)
-        forward = spot * np.exp(r * T)
+
+        # Determine interest rate
+        if rate_func is not None:
+            r = rate_func(T)
+
+        # Compute model forward: F = S * exp((r - q - repo) * T) - PV(divs)
+        div_yield = 0.0
+        pv_divs = 0.0
+        if dividend_info is not None:
+            div_yield = dividend_info.continuous_yield
+            if dividend_info.discrete_dividends and not dividend_info.is_index:
+                from .dividends import pv_discrete_dividends
+                pv_divs = pv_discrete_dividends(
+                    dividend_info.discrete_dividends,
+                    rate_func or (lambda t: r),
+                    datetime.now(),
+                )
+        forward_model = spot * np.exp((r - div_yield - repo_rate) * T) - pv_divs
 
         chain = tk.option_chain(best_exp)
         calls = chain.calls
+        puts = chain.puts
+
+        if calls.empty:
+            return None
+
+        # Compute put-call parity forward
+        forward_parity = None
+        put_mid_prices = None
+        if not puts.empty:
+            put_strikes = puts["strike"].values.astype(float)
+            put_bid = puts["bid"].fillna(0).values.astype(float)
+            put_ask = puts["ask"].fillna(0).values.astype(float)
+            put_last = puts["lastPrice"].fillna(0).values.astype(float)
+
+            # Compute put mid prices
+            if (put_bid > 0).sum() > len(puts) * 0.3:  # market open
+                put_prices_all = np.where((put_bid > 0) & (put_ask > 0), (put_bid + put_ask) / 2.0, put_last)
+            else:
+                put_prices_all = put_last
+
+            # Match puts to calls by strike
+            call_strikes_all = calls["strike"].values.astype(float)
+            call_bid_all = calls["bid"].fillna(0).values.astype(float)
+            call_ask_all = calls["ask"].fillna(0).values.astype(float)
+            call_last_all = calls["lastPrice"].fillna(0).values.astype(float)
+            if (call_bid_all > 0).sum() > len(calls) * 0.3:
+                call_prices_all = np.where((call_bid_all > 0) & (call_ask_all > 0), (call_bid_all + call_ask_all) / 2.0, call_last_all)
+            else:
+                call_prices_all = call_last_all
+
+            # Find common strikes
+            common_strikes = np.intersect1d(call_strikes_all, put_strikes)
+            if len(common_strikes) >= 3:
+                c_idx = np.searchsorted(call_strikes_all, common_strikes)
+                p_idx = np.searchsorted(put_strikes, common_strikes)
+                c_prices = call_prices_all[c_idx]
+                p_prices = put_prices_all[p_idx]
+                forward_parity, _ = _compute_parity_forward(c_prices, p_prices, common_strikes, r, T)
+
+        # Always use model forward for consistency with prior (which also uses model)
+        # Parity forward is kept as reference/validation only
+        forward = forward_model
 
         if calls.empty:
             return None
@@ -183,7 +293,7 @@ def fetch_option_chain(
             prev_spot = float(hist["Close"].iloc[-2])
         else:
             prev_spot = spot
-        prev_forward = prev_spot * np.exp(r * T)
+        prev_forward = prev_spot * np.exp((r - div_yield - repo_rate) * T) - pv_divs
 
         prev_prices = last[valid] if not np.all(valid) else last
         # Recompute: prev_prices from the filtered arrays
@@ -232,6 +342,11 @@ def fetch_option_chain(
             prev_close_ivs=prev_close_ivs,
             prev_close_atm_iv=float(prev_atm_iv),
             prev_spot=float(prev_spot),
+            forward_parity=forward_parity,
+            forward_model=float(forward_model),
+            rate_used=float(r),
+            div_yield_used=float(div_yield),
+            repo_rate_used=float(repo_rate),
         )
 
     except Exception as e:
@@ -245,11 +360,19 @@ def fetch_universe_quotes(
     tickers: List[str],
     target_maturity_days: int = 30,
     r: float = 0.045,
+    rate_func=None,
+    dividend_map: Optional[Dict] = None,
+    repo_map: Optional[Dict[str, float]] = None,
 ) -> Dict[str, OptionChainData]:
     """Fetch option chains for all tickers in the universe."""
     results = {}
     for t in tickers:
-        data = fetch_option_chain(t, target_maturity_days, r=r)
+        div_info = dividend_map.get(t) if dividend_map else None
+        repo = repo_map.get(t, 0.0) if repo_map else 0.0
+        data = fetch_option_chain(
+            t, target_maturity_days, r=r,
+            rate_func=rate_func, dividend_info=div_info, repo_rate=repo,
+        )
         if data is not None:
             results[t] = data
     return results

@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { api } from "../api/client";
+import { useEngine } from "../hooks/useEngine";
 import DistributionTripleView from "./DistributionTripleView";
 import SmileView from "./SmileView";
 import type { NodeDistributionResponse, SmileData, QuoteSnapshot } from "../types";
@@ -13,8 +14,14 @@ interface Props {
 }
 
 export default function ObservedNodeView({ ticker, smileData, quoteData }: Props) {
+  const {
+    excludedQuotes, resetExclusions,
+    addedQuotes, resetAdditions,
+  } = useEngine();
   const [distData, setDistData] = useState<NodeDistributionResponse | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("smile");
+  const excluded = excludedQuotes[ticker] ?? [];
+  const added = addedQuotes[ticker] ?? [];
 
   useEffect(() => {
     if (!ticker) return;
@@ -43,11 +50,23 @@ export default function ObservedNodeView({ ticker, smileData, quoteData }: Props
             {m === "smile" ? "Smile (IV vs Strike)" : "IV / CDF / LQD"}
           </button>
         ))}
-        {distData && (
-          <span style={{ fontSize: 10, color: "#64748b", marginLeft: "auto", alignSelf: "center" }}>
-            W2: {distData.wasserstein_dist.toFixed(4)}
-          </span>
-        )}
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
+          {excluded.length > 0 && (
+            <button onClick={() => resetExclusions(ticker)} style={actionBtn}>
+              Reset exclusions ({excluded.length})
+            </button>
+          )}
+          {added.length > 0 && (
+            <button onClick={() => resetAdditions(ticker)} style={actionBtn}>
+              Forget additions ({added.length})
+            </button>
+          )}
+          {distData && (
+            <span style={{ fontSize: 10, color: "#64748b" }}>
+              W2: {distData.wasserstein_dist.toFixed(4)}
+            </span>
+          )}
+        </div>
       </div>
 
       {viewMode === "smile" && (
@@ -75,3 +94,13 @@ export default function ObservedNodeView({ ticker, smileData, quoteData }: Props
     </div>
   );
 }
+
+const actionBtn: React.CSSProperties = {
+  fontSize: 11,
+  color: "#94a3b8",
+  background: "#1e293b",
+  border: "1px solid #334155",
+  borderRadius: 4,
+  padding: "3px 10px",
+  cursor: "pointer",
+};

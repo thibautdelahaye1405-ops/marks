@@ -2,7 +2,7 @@
 Configuration for the Graph-Regularised Vol Marking engine.
 """
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -38,10 +38,15 @@ class EngineConfig:
     alpha_liquid: float = 0.1           # self-trust for liquid nodes
     alpha_illiquid: float = 0.3         # self-trust for illiquid nodes
     target_maturity_days: int = 30      # target expiry for Phase 1
-    risk_free_rate: float = 0.045       # annualised
+    risk_free_rate: Optional[float] = None  # None = use Treasury curve, float = flat override
+    repo_rate_gc: float = 0.0           # GC (General Collateral) repo rate applied to all names by default
+    repo_overrides: Dict[str, float] = field(default_factory=dict)  # per-ticker repo rate overrides for hard-to-borrow names
     tail_reg_weight: float = 1.0        # omega_tail for tail basis coefficients
     interior_reg_weight: float = 0.01   # omega_m for interior Legendre terms
     epsilon_tail: float = 0.01          # lower bound for tail coefficients β₁, β₂
+
+    def repo_rate_for(self, ticker: str) -> float:
+        return self.repo_overrides.get(ticker, self.repo_rate_gc)
 
 
 DEFAULT_CORRELATIONS = {

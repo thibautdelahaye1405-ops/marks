@@ -32,6 +32,7 @@ function App() {
     solveResult,
     graphData,
     selectedNode,
+    universe,
     fetchUniverse,
     fetchGraph,
     setSelectedNode,
@@ -142,6 +143,52 @@ function App() {
             {/* Detail panel: only shown when a node is selected AND on graph view */}
             {hasSelection && mainView === "graph" && (
               <div style={detailPanelStyle}>
+                {/* Asset header */}
+                {(() => {
+                  const q = selectedQuote;
+                  const asset = universe.find((a) => a.ticker === selectedNode);
+                  const name = asset?.name ?? "";
+                  const spot = q?.spot;
+                  const prevSpot = q?.prev_spot;
+                  const change = spot != null && prevSpot != null && prevSpot > 0
+                    ? ((spot - prevSpot) / prevSpot * 100)
+                    : null;
+                  const changeColor = change != null ? (change >= 0 ? "#22c55e" : "#ef4444") : "#94a3b8";
+                  return (
+                    <div style={assetHeaderStyle}>
+                      <span style={{ fontWeight: 700, color: "#e2e8f0", fontSize: 13 }}>
+                        {selectedNode}
+                      </span>
+                      <span style={{ color: "#94a3b8", fontSize: 11 }}>{name}</span>
+                      {spot != null && (
+                        <span style={{ color: "#cbd5e1", fontSize: 11 }}>
+                          Spot = {spot.toFixed(2)}
+                        </span>
+                      )}
+                      {change != null && (
+                        <span style={{ color: changeColor, fontSize: 11 }}>
+                          {change >= 0 ? "+" : ""}{change.toFixed(2)}%
+                        </span>
+                      )}
+                      {prevSpot != null && (
+                        <span style={{ color: "#64748b", fontSize: 10 }}>
+                          Prev Close = {prevSpot.toFixed(2)}
+                        </span>
+                      )}
+                      {q?.expiry && (() => {
+                        const d = new Date(q.expiry + "T00:00:00");
+                        const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+                        const fmt = `${d.getDate()}-${months[d.getMonth()]}-${String(d.getFullYear()).slice(2)}`;
+                        return (
+                          <span style={{ color: "#e2e8f0", fontSize: 11, fontWeight: 700 }}>
+                            Expiry = {fmt}
+                          </span>
+                        );
+                      })()}
+                    </div>
+                  );
+                })()}
+
                 {/* Detail tabs */}
                 <div style={detailTabBar}>
                   {(
@@ -313,6 +360,17 @@ const detailPanelStyle: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
   overflow: "hidden",
+};
+
+const assetHeaderStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 10,
+  padding: "6px 14px",
+  borderBottom: "1px solid #1e293b",
+  background: "#0f172a",
+  flexShrink: 0,
+  flexWrap: "wrap",
 };
 
 const detailTabBar: React.CSSProperties = {

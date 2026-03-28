@@ -113,7 +113,7 @@ export default function GraphView({
           id: a.ticker,
           label: a.ticker,
           color: observedColor(0.3),
-          size: 12 + ranks[i] * 8,
+          size: 60 + ranks[i] * 40,
         },
         position: positions[a.ticker],
       });
@@ -150,29 +150,30 @@ export default function GraphView({
             "background-color": "data(color)",
             width: "data(size)",
             height: "data(size)",
-            "border-width": 0.5,
+            "border-width": 1,
             "border-color": "rgba(255,255,255,0.3)",
             label: "data(label)",
-            "font-size": "9px",
-            "text-valign": "bottom",
+            "font-size": "11px",
+            "text-valign": "center",
             "text-halign": "center",
-            "text-margin-y": 4,
-            color: "#94a3b8",
-            "font-weight": "600",
+            color: "#fff",
+            "font-weight": "700",
+            "text-outline-color": "data(color)",
+            "text-outline-opacity": 0.6,
             "text-outline-width": 0,
           },
         },
         {
           selector: "node.selected",
           style: {
-            "border-width": 2.5,
+            "border-width": 3,
             "border-color": "#fff",
           },
         },
         {
           selector: "node.hover",
           style: {
-            "border-width": 2,
+            "border-width": 2.5,
             "border-color": "#fff",
           },
         },
@@ -267,7 +268,7 @@ export default function GraphView({
         : inferredColor(w2Intensity);
 
       node.data("color", color);
-      node.data("size", 12 + influenceRanks[i] * 8);
+      node.data("size", 60 + influenceRanks[i] * 40);
     }
   }, [solveResult, graphData]);
 

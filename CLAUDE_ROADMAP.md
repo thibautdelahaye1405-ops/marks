@@ -1,30 +1,31 @@
 # Vol Marking — Development Roadmap
 
-## 1. Forwards & Rates
+## 1. Forwards & Rates ✅ DONE
 
-### 1.1 Forward fitting from put-call parity ⭐ HIGH PRIORITY
-- Currently `F = S * exp(rT)` with hardcoded `r=0.045` — wrong for dividend-paying stocks
-- Fit forward from put-call parity: `F = K + exp(rT) * (C(K) - P(K))` at liquid ATM strikes
-- This fixes all downstream SVI fits (currently shifted due to wrong forward)
-- Fallback: use hardcoded r when put data is unavailable
+### 1.1 Forward fitting from put-call parity ✅
+- Fetches both calls and puts from Yahoo Finance
+- Put-call parity: `F = K* + exp(rT)(C(K*) - P(K*))` where K* minimises |C-P|
+- Parity forward shown as reference (dashed gray line), model forward used for fitting
+- Consistent: both prior (F_prev) and current smile use model forward
 
-### 1.2 Interest rate curve
-- Default: flat rate from user input (current: 0.045)
-- Source selection: manual input, Treasury curve (FRED API), OIS
-- Term structure: interpolate to each expiry's maturity
-- Store in referential config, per-currency
+### 1.2 Interest rate curve ✅
+- FRED Treasury curve: 11 tenors (1M to 30Y), fetched from public CSV endpoint
+- Log-maturity interpolation to each expiry's T
+- 1-hour cache, fallback to 4.5% flat if FRED unavailable
+- `config.risk_free_rate`: None = Treasury curve (default), float = flat override
 
-### 1.3 Dividends and repo
-- Discrete dividends for single stocks (ex-dates + amounts)
-- Continuous dividend yield for indices (SPY, QQQ)
-- Sources: manual input, Yahoo Finance (limited), Bloomberg (future)
-- Forward: `F = S * exp((r - q)T) - PV(discrete divs)`
-- Repo rate: typically zero for equities, but configurable
+### 1.3 Dividends and repo ✅
+- Continuous dividend yield from Yahoo Finance (`trailingAnnualDividendYield`)
+- Discrete dividends for stocks: projected from historical pattern
+- PV of discrete dividends: `sum(d_i * exp(-r(T_i)*T_i))`
+- Repo: GC rate (default 0%) + per-ticker overrides for hard-to-borrow
+- Full forward: `F = S * exp((r - q - repo)*T) - PV(discrete divs)`
 
-### 1.4 Forward validation
-- Display fitted forward vs model forward on smile charts
-- Warning indicator when difference > 0.5%
-- Option to lock forward to market-implied value
+### 1.4 Forward validation ✅
+- Dual forward lines on charts: model (amber) + parity reference (gray dashed)
+- Info bar: F, r, q, repo, parity-vs-model % with red/green colour coding
+- Forward slider with +/- buttons in both Smile and Prior tabs (independent)
+- SVI sliders track forward changes and revert on reset
 
 ---
 

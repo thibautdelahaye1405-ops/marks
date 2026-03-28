@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import Plot from "./Plot";
 import SviSliders from "./SviSliders";
 import { api } from "../api/client";
@@ -19,6 +19,42 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
 
   const added = addedQuotes[ticker] ?? [];
 
+  // Forward adjustment state
+  const [fwdOverride, setFwdOverride] = useState<number | null>(null);
+  const modelFwd = quoteData?.forward_model ?? quoteData?.forward ?? 100;
+  const effectiveFwd = fwdOverride ?? quoteData?.forward ?? modelFwd;
+  const fwdTimerRef = useRef<ReturnType<typeof setTimeout>>();
+
+  // Reset forward override when ticker changes
+  useEffect(() => {
+    setFwdOverride(null);
+  }, [ticker]);
+
+  const handleFwdChange = useCallback((val: number) => {
+    setFwdOverride(val);
+    // Debounce API call
+    clearTimeout(fwdTimerRef.current);
+    fwdTimerRef.current = setTimeout(() => {
+      api.setForwardOverride(ticker, val).then(() => {
+        useEngine.getState().fit();
+      }).catch(() => {});
+    }, 150);
+  }, [ticker]);
+
+  const handleFwdReset = useCallback(() => {
+    setFwdOverride(null);
+    api.setForwardOverride(ticker, null).then(() => {
+      useEngine.getState().fit();
+    }).catch(() => {});
+  }, [ticker]);
+
+  const fwdRef = useRef(effectiveFwd);
+  fwdRef.current = effectiveFwd;
+  const nudgeFwd = useCallback((dir: number) => {
+    const step = modelFwd * 0.001; // 0.1% of forward
+    handleFwdChange(fwdRef.current + dir * step);
+  }, [modelFwd, handleFwdChange]);
+
   // SVI parameter override state
   const [sviParams, setSviParams] = useState<{ a: number; b: number; rho: number; m: number; sigma: number } | null>(null);
   const [baseSviParams, setBaseSviParams] = useState<{ a: number; b: number; rho: number; m: number; sigma: number } | null>(null);
@@ -29,10 +65,13 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
     if (smileData?.beta && smileData.beta.length >= 5 && smileData.is_observed) {
       const p = { a: smileData.beta[0], b: smileData.beta[1], rho: smileData.beta[2], m: smileData.beta[3], sigma: smileData.beta[4] };
       setSviParams(p);
-      setBaseSviParams(p);
+      // Only update base when forward is NOT overridden — so slider shows delta
+      if (fwdOverride == null) {
+        setBaseSviParams(p);
+      }
       setOverriddenSmile(null);
     }
-  }, [smileData]);
+  }, [smileData, fwdOverride]);
 
   const handleSviChange = useCallback(
     (params: { a: number; b: number; rho: number; m: number; sigma: number }) => {
@@ -191,45 +230,77 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
         layout={{
           title: {
             text: `${ticker} -- IV Smile (${subtitle})`,
-            font: { color: "#e2e8f0", size: 14 },
+            font: { color: "#e2e8f0", size: 13 },
           },
           paper_bgcolor: "#1e293b",
           plot_bgcolor: "#1e293b",
           font: { color: "#94a3b8" },
-          shapes: quoteData ? [{
-            type: "line", x0: quoteData.forward, x1: quoteData.forward,
-            y0: 0, y1: 1, yref: "paper",
-            line: { color: "#f59e0b", width: 1, dash: "dot" },
-          }] : [],
-          annotations: quoteData ? [{
-            x: quoteData.forward, y: 1.02, yref: "paper",
-            text: `F=${quoteData.forward.toFixed(0)}`,
-            showarrow: false, font: { color: "#f59e0b", size: 9 },
-          }] : [],
+          shapes: quoteData ? [
+            // Active forward line (follows slider)
+            {
+              type: "line", x0: effectiveFwd, x1: effectiveFwd,
+              y0: 0, y1: 1, yref: "paper",
+              line: { color: "#f59e0b", width: 1, dash: "dot" },
+            },
+            // Parity forward (reference, if available)
+            ...(quoteData.forward_parity != null ? [{
+              type: "line" as const, x0: quoteData.forward_parity, x1: quoteData.forward_parity,
+              y0: 0, y1: 1, yref: "paper" as const,
+              line: { color: "#94a3b8", width: 1, dash: "dash" as const },
+            }] : []),
+          ] : [],
+          annotations: quoteData ? [
+            {
+              x: effectiveFwd, y: 1.02, yref: "paper",
+              text: `F=${effectiveFwd.toFixed(1)}`,
+              showarrow: false, font: { color: "#f59e0b", size: 9 },
+            },
+            ...(quoteData.forward_parity != null ? [{
+              x: quoteData.forward_parity, y: 0.96, yref: "paper" as const,
+              text: `F(parity)=${quoteData.forward_parity.toFixed(1)}`,
+              showarrow: false, font: { color: "#94a3b8", size: 8 },
+            }] : []),
+          ] : [],
           xaxis: { title: "Strike", gridcolor: "#334155", zerolinecolor: "#334155" },
           yaxis: { title: "Implied Vol (%)", gridcolor: "#334155", zerolinecolor: "#334155" },
-          legend: { x: 1, y: 1, xanchor: "right", bgcolor: "rgba(0,0,0,0)" },
-          margin: { t: 40, r: 20, b: 50, l: 60 },
+          legend: { x: 1, y: 1, xanchor: "right", bgcolor: "rgba(0,0,0,0)", font: { size: 9 } },
+          margin: { t: 35, r: 20, b: 45, l: 55 },
           autosize: true,
-          height: 450,
+          height: 440,
         }}
-        style={{ width: "100%", height: 450 }}
+        style={{ width: "100%", height: 440 }}
         config={{ displayModeBar: false, doubleClick: false }}
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
       />
-      <div style={{ padding: "4px 16px", display: "flex", justifyContent: "flex-end", gap: 8 }}>
-        {excluded.size > 0 && (
-          <button onClick={() => resetExclusions(ticker)} style={actionBtn}>
-            Reset exclusions ({excluded.size})
-          </button>
-        )}
-        {added.length > 0 && (
-          <button onClick={() => resetAdditions(ticker)} style={actionBtn}>
-            Forget additions ({added.length})
-          </button>
-        )}
-      </div>
+      {quoteData && (
+        <div style={{ padding: "2px 16px", fontSize: 10, color: "#94a3b8", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          <span style={{ fontWeight: 600, color: "#f59e0b" }}>F={effectiveFwd.toFixed(1)}</span>
+          <button onClick={() => nudgeFwd(-1)} style={fwdNudgeBtn}>{"\u2212"}</button>
+          <input
+            type="range"
+            min={modelFwd * 0.95}
+            max={modelFwd * 1.05}
+            step={modelFwd * 0.0005}
+            value={effectiveFwd}
+            onChange={(e) => handleFwdChange(parseFloat(e.target.value))}
+            style={{ width: 80, accentColor: "#f59e0b", height: 3, margin: 0 }}
+          />
+          <button onClick={() => nudgeFwd(1)} style={fwdNudgeBtn}>+</button>
+          {fwdOverride != null && (
+            <button onClick={handleFwdReset} style={{ ...fwdNudgeBtn, fontSize: 8, padding: "0 4px" }}>rst</button>
+          )}
+          <span style={{ color: "#334155" }}>|</span>
+          {quoteData.rate_used != null && <span>r={(quoteData.rate_used * 100).toFixed(2)}%</span>}
+          {quoteData.div_yield_used != null && quoteData.div_yield_used > 0 && <span>q={(quoteData.div_yield_used * 100).toFixed(2)}%</span>}
+          {quoteData.repo_rate_used != null && quoteData.repo_rate_used > 0 && <span>repo={(quoteData.repo_rate_used * 100).toFixed(2)}%</span>}
+          {quoteData.forward_parity != null && quoteData.forward_model != null && (() => {
+            const diff = Math.abs(quoteData.forward_parity! - quoteData.forward_model!) / quoteData.forward_model! * 100;
+            const color = diff > 0.5 ? "#ef4444" : "#22c55e";
+            return <><span style={{ color: "#334155" }}>|</span><span style={{ color }}>parity vs model: {diff.toFixed(2)}%</span></>;
+          })()}
+        </div>
+      )}
       {/* SVI parameter sliders for observed nodes */}
       {sviParams && displaySmile?.is_observed && (
         <div style={{ padding: "0 16px", borderTop: "1px solid #334155", marginTop: 4, paddingTop: 8 }}>
@@ -247,6 +318,21 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
     </div>
   );
 }
+
+const fwdNudgeBtn: React.CSSProperties = {
+  width: 16,
+  height: 16,
+  padding: 0,
+  fontSize: 11,
+  lineHeight: "14px",
+  textAlign: "center",
+  background: "#1e293b",
+  color: "#94a3b8",
+  border: "1px solid #334155",
+  borderRadius: 3,
+  cursor: "pointer",
+  flexShrink: 0,
+};
 
 const actionBtn: React.CSSProperties = {
   fontSize: 11,

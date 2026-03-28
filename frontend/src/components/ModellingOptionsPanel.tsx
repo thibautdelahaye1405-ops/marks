@@ -1,5 +1,6 @@
-import { useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { useEngine } from "../hooks/useEngine";
+import { api } from "../api/client";
 
 function HoldButton({ onAction, children, style }: {
   onAction: () => void;
@@ -25,6 +26,27 @@ function HoldButton({ onAction, children, style }: {
 
 export default function ModellingOptionsPanel() {
   const { lambda, eta, setLambda, setEta } = useEngine();
+
+  const [repoGc, setRepoGc] = useState(0.0);
+  const [treasuryCurve, setTreasuryCurve] = useState<{ date: string; tenors: number[]; rates: number[] } | null>(null);
+
+  useEffect(() => {
+    api.getTreasuryCurve().then(setTreasuryCurve).catch(() => {});
+    api.getRatesConfig().then((c) => setRepoGc(c.repo_rate_gc)).catch(() => {});
+  }, []);
+
+  const handleRepoChange = useCallback((val: number) => {
+    setRepoGc(val);
+    api.updateRatesConfig({ repo_rate_gc: val, repo_overrides: {} }).catch(() => {});
+  }, []);
+
+  const repoRef = useRef(repoGc);
+  repoRef.current = repoGc;
+  const nudgeRepo = useCallback((dir: number) => {
+    const next = Math.max(0, Math.min(0.10, repoRef.current + dir * 0.001));
+    repoRef.current = next;
+    handleRepoChange(next);
+  }, [handleRepoChange]);
 
   const logStep = 0.01;
 
@@ -105,6 +127,39 @@ export default function ModellingOptionsPanel() {
           </div>
           <span style={rangeHint}>0.0001 -- 0.1</span>
         </label>
+      </div>
+
+      {/* Forwards & Rates */}
+      <div>
+        <div style={sectionTitle}>Forwards & Rates</div>
+        <label style={labelStyle}>
+          <span style={labelText}>
+            GC Repo Rate: {(repoGc * 100).toFixed(2)}%
+          </span>
+          <div style={sliderRow}>
+            <HoldButton onAction={() => nudgeRepo(-1)} style={nudgeBtn}>
+              {"\u2212"}
+            </HoldButton>
+            <input
+              type="range"
+              min={0}
+              max={0.10}
+              step={0.001}
+              value={repoGc}
+              onChange={(e) => handleRepoChange(parseFloat(e.target.value))}
+              style={sliderStyle}
+            />
+            <HoldButton onAction={() => nudgeRepo(1)} style={nudgeBtn}>
+              +
+            </HoldButton>
+          </div>
+          <span style={rangeHint}>0% -- 10%</span>
+        </label>
+        {treasuryCurve && (
+          <div style={{ marginTop: 8, fontSize: 10, color: "#64748b" }}>
+            UST {treasuryCurve.date}: 1M={((treasuryCurve.rates[0] ?? 0) * 100).toFixed(1)}% 1Y={((treasuryCurve.rates[3] ?? 0) * 100).toFixed(1)}%
+          </div>
+        )}
       </div>
 
       {/* Smile model */}

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useEngine } from "../hooks/useEngine";
 import { api } from "../api/client";
 import DistributionTripleView from "./DistributionTripleView";
@@ -24,6 +24,71 @@ export default function PriorCalibrationView() {
   const ticker = selectedNode;
   const isObserved = ticker ? observedTickers.includes(ticker) : false;
   const excluded = new Set(ticker ? excludedPriorQuotes[ticker] ?? [] : []);
+
+  // Prior forward adjustment (F_prev, separate from current smile's forward)
+  const [fwdOverride, setFwdOverride] = useState<number | null>(null);
+  const fwdTimerRef = useRef<ReturnType<typeof setTimeout>>();
+
+  useEffect(() => { setFwdOverride(null); }, [ticker]);
+
+  const quoteDataForFwd = ticker ? quotes[ticker] : null;
+  // Prior uses prev_spot-based forward, not current forward
+  const prevSpot = quoteDataForFwd?.prev_spot ?? quoteDataForFwd?.spot ?? 100;
+  const modelPrevFwd = quoteDataForFwd?.forward_model != null
+    ? prevSpot / (quoteDataForFwd?.spot ?? 1) * quoteDataForFwd.forward_model
+    : prevSpot;
+  const effectivePrevFwd = fwdOverride ?? (currentView?.fit_forward ?? modelPrevFwd);
+
+  // Update view + SVI params (but NOT base) — used by forward slider
+  const _updateViewOnly = useCallback((view: DistributionView) => {
+    setCurrentView(view);
+    const b = view.beta;
+    if (b && b.length >= 5) {
+      setSviParams({ a: b[0], b: b[1], rho: b[2], m: b[3], sigma: b[4] });
+    }
+  }, []);
+
+  // Update view + SVI params AND base — used by exclusion/addition changes
+  const _updateViewAndBase = useCallback((view: DistributionView) => {
+    setCurrentView(view);
+    const b = view.beta;
+    if (b && b.length >= 5) {
+      const p = { a: b[0], b: b[1], rho: b[2], m: b[3], sigma: b[4] };
+      setSviParams(p);
+      setBaseSviParams(p);
+    }
+  }, []);
+
+  const handleFwdChange = useCallback((val: number) => {
+    if (!ticker) return;
+    setFwdOverride(val);
+    clearTimeout(fwdTimerRef.current);
+    fwdTimerRef.current = setTimeout(() => {
+      api.setPriorForwardOverride(ticker, val).then(() => {
+        const excl = excludedPriorQuotes[ticker] ?? [];
+        const added = addedPriorQuotes[ticker] ?? [];
+        api.refitPrior(ticker, excl, added).then(_updateViewOnly).catch(() => {});
+      }).catch(() => {});
+    }, 150);
+  }, [ticker, excludedPriorQuotes, addedPriorQuotes, _updateViewOnly]);
+
+  const handleFwdReset = useCallback(() => {
+    if (!ticker) return;
+    setFwdOverride(null);
+    api.setPriorForwardOverride(ticker, null).then(() => {
+      const excl = excludedPriorQuotes[ticker] ?? [];
+      const added = addedPriorQuotes[ticker] ?? [];
+      // Reset restores base, so update both
+      api.refitPrior(ticker, excl, added).then(_updateViewAndBase).catch(() => {});
+    }).catch(() => {});
+  }, [ticker, excludedPriorQuotes, addedPriorQuotes, _updateViewAndBase]);
+
+  const fwdRef = useRef(effectivePrevFwd);
+  fwdRef.current = effectivePrevFwd;
+  const nudgeFwd = useCallback((dir: number) => {
+    const step = modelPrevFwd * 0.001;
+    handleFwdChange(fwdRef.current + dir * step);
+  }, [modelPrevFwd, handleFwdChange]);
 
   // Fetch prior when ticker changes or priors are reloaded
   useEffect(() => {
@@ -52,16 +117,8 @@ export default function PriorCalibrationView() {
     const excl = excludedPriorQuotes[ticker] ?? [];
     const added = addedPriorQuotes[ticker] ?? [];
     if (excl.length === 0 && added.length === 0) return;
-    api.refitPrior(ticker, excl, added).then((view) => {
-      setCurrentView(view);
-      const b = view.beta;
-      if (b && b.length >= 5) {
-        const p = { a: b[0], b: b[1], rho: b[2], m: b[3], sigma: b[4] };
-        setSviParams(p);
-        setBaseSviParams(p);
-      }
-    }).catch(() => {});
-  }, [ticker, isObserved, excludedPriorQuotes, addedPriorQuotes]);
+    api.refitPrior(ticker, excl, added).then(_updateViewAndBase).catch(() => {});
+  }, [ticker, isObserved, excludedPriorQuotes, addedPriorQuotes, _updateViewAndBase]);
 
   const handleSviChange = useCallback(
     (params: { a: number; b: number; rho: number; m: number; sigma: number }) => {
@@ -82,21 +139,15 @@ export default function PriorCalibrationView() {
     if (!ticker) return;
     resetPriorExclusions(ticker);
     const added = addedPriorQuotes[ticker] ?? [];
-    api.refitPrior(ticker, [], added).then((view) => {
-      setCurrentView(view);
-      setBeta(view.beta ?? [0, 0, 0, 0, 0]);
-    }).catch(() => {});
-  }, [ticker, resetPriorExclusions, addedPriorQuotes]);
+    api.refitPrior(ticker, [], added).then(_updateViewAndBase).catch(() => {});
+  }, [ticker, resetPriorExclusions, addedPriorQuotes, _updateViewAndBase]);
 
   const handleResetAdditions = useCallback(() => {
     if (!ticker) return;
     resetPriorAdditions(ticker);
     const excl = excludedPriorQuotes[ticker] ?? [];
-    api.refitPrior(ticker, excl, []).then((view) => {
-      setCurrentView(view);
-      setBeta(view.beta ?? [0, 0, 0, 0, 0]);
-    }).catch(() => {});
-  }, [ticker, resetPriorAdditions, excludedPriorQuotes]);
+    api.refitPrior(ticker, excl, []).then(_updateViewAndBase).catch(() => {});
+  }, [ticker, resetPriorAdditions, excludedPriorQuotes, _updateViewAndBase]);
 
   const handlePriorQuoteClick = useCallback(
     (event: any) => {
@@ -226,27 +277,9 @@ export default function PriorCalibrationView() {
   }
 
   return (
-    <div style={{ padding: "8px 12px", overflow: "auto" }}>
-      {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-        <h3 style={{ margin: 0, fontSize: 14, color: "#e2e8f0" }}>
-          Prior: {ticker}
-          {!isObserved && <span style={{ fontSize: 11, color: "#f97316", marginLeft: 8 }}>(inferred)</span>}
-        </h3>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          {saveStatus && (
-            <span style={{ fontSize: 10, color: saveStatus === "saved" ? "#22c55e" : saveStatus === "error" ? "#f87171" : "#94a3b8" }}>
-              {saveStatus === "saved" ? "Saved" : saveStatus === "error" ? "Failed" : "Saving..."}
-            </span>
-          )}
-          <button onClick={handleSavePrior} style={saveBtnStyle}>
-            Save Prior
-          </button>
-        </div>
-      </div>
-
-      {/* View toggle */}
-      <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
+    <div style={{ overflow: "auto" }}>
+      {/* View toggle + save */}
+      <div style={{ display: "flex", gap: 4, padding: "8px 12px 4px", alignItems: "center" }}>
         {(["smile", "distributions"] as ViewMode[]).map((m) => (
           <button
             key={m}
@@ -264,6 +297,26 @@ export default function PriorCalibrationView() {
             {m === "smile" ? "Smile (IV vs Strike)" : "IV / CDF / LQD"}
           </button>
         ))}
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
+          {isObserved && excluded.size > 0 && (
+            <button onClick={handleResetExclusions} style={actionBtnStyle}>
+              Reset exclusions ({excluded.size})
+            </button>
+          )}
+          {isObserved && addedPrior.length > 0 && (
+            <button onClick={handleResetAdditions} style={actionBtnStyle}>
+              Forget additions ({addedPrior.length})
+            </button>
+          )}
+          {saveStatus && (
+            <span style={{ fontSize: 10, color: saveStatus === "saved" ? "#22c55e" : saveStatus === "error" ? "#f87171" : "#94a3b8" }}>
+              {saveStatus === "saved" ? "Saved" : saveStatus === "error" ? "Failed" : "Saving..."}
+            </span>
+          )}
+          <button onClick={handleSavePrior} style={saveBtnStyle}>
+            Save Prior
+          </button>
+        </div>
       </div>
 
       {/* Smile view */}
@@ -302,13 +355,13 @@ export default function PriorCalibrationView() {
               plot_bgcolor: "#1e293b",
               font: { color: "#94a3b8" },
               shapes: [
-                // Prior's forward (prev close)
-                ...((currentView ?? priorView).fit_forward ? [{
-                  type: "line" as const, x0: (currentView ?? priorView).fit_forward!, x1: (currentView ?? priorView).fit_forward!,
+                // Prior's forward (follows slider)
+                {
+                  type: "line" as const, x0: effectivePrevFwd, x1: effectivePrevFwd,
                   y0: 0, y1: 1, yref: "paper" as const,
                   line: { color: "#22c55e", width: 1, dash: "dot" as const },
-                }] : []),
-                // Current forward
+                },
+                // Current forward (reference)
                 ...(quoteData ? [{
                   type: "line" as const, x0: quoteData.forward, x1: quoteData.forward,
                   y0: 0, y1: 1, yref: "paper" as const,
@@ -316,11 +369,11 @@ export default function PriorCalibrationView() {
                 }] : []),
               ],
               annotations: [
-                ...((currentView ?? priorView).fit_forward ? [{
-                  x: (currentView ?? priorView).fit_forward!, y: 1.05, yref: "paper" as const,
-                  text: `F_prev=${(currentView ?? priorView).fit_forward!.toFixed(0)}`,
+                {
+                  x: effectivePrevFwd, y: 1.05, yref: "paper" as const,
+                  text: `F_prev=${effectivePrevFwd.toFixed(1)}`,
                   showarrow: false, font: { color: "#22c55e", size: 9 },
-                }] : []),
+                },
                 ...(quoteData ? [{
                   x: quoteData.forward, y: 1.02, yref: "paper" as const,
                   text: `F=${quoteData.forward.toFixed(0)}`,
@@ -330,29 +383,32 @@ export default function PriorCalibrationView() {
               xaxis: { title: "Strike", gridcolor: "#334155", zerolinecolor: "#334155" },
               yaxis: { title: "Implied Vol (%)", gridcolor: "#334155", zerolinecolor: "#334155" },
               legend: { x: 1, y: 1, xanchor: "right", bgcolor: "rgba(0,0,0,0)", font: { size: 9 } },
-              margin: { t: 35, r: 15, b: 45, l: 55 },
+              margin: { t: 35, r: 20, b: 45, l: 55 },
               autosize: true,
-              height: 350,
+              height: 440,
             }}
-            style={{ width: "100%", height: 350 }}
+            style={{ width: "100%", height: 440 }}
             config={{ displayModeBar: false, doubleClick: false }}
             onClick={isObserved ? handlePriorQuoteClick : undefined}
             onDoubleClick={isObserved ? handlePriorDoubleClick : undefined}
           />
-          {isObserved && (excluded.size > 0 || addedPrior.length > 0) && (
-            <div style={{ padding: "4px 0", display: "flex", justifyContent: "flex-end", gap: 8 }}>
-              {excluded.size > 0 && (
-                <button onClick={handleResetExclusions} style={actionBtnStyle}>
-                  Reset exclusions ({excluded.size})
-                </button>
-              )}
-              {addedPrior.length > 0 && (
-                <button onClick={handleResetAdditions} style={actionBtnStyle}>
-                  Forget additions ({addedPrior.length})
-                </button>
-              )}
-            </div>
-          )}
+          <div style={{ padding: "2px 16px", fontSize: 10, color: "#94a3b8", display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontWeight: 600, color: "#22c55e" }}>F_prev={effectivePrevFwd.toFixed(1)}</span>
+            <button onClick={() => nudgeFwd(-1)} style={fwdNudgeBtn}>{"\u2212"}</button>
+            <input
+              type="range"
+              min={modelPrevFwd * 0.95}
+              max={modelPrevFwd * 1.05}
+              step={modelPrevFwd * 0.0005}
+              value={effectivePrevFwd}
+              onChange={(e) => handleFwdChange(parseFloat(e.target.value))}
+              style={{ width: 80, accentColor: "#22c55e", height: 3, margin: 0 }}
+            />
+            <button onClick={() => nudgeFwd(1)} style={fwdNudgeBtn}>+</button>
+            {fwdOverride != null && (
+              <button onClick={handleFwdReset} style={{ ...fwdNudgeBtn, fontSize: 8, padding: "0 4px" }}>rst</button>
+            )}
+          </div>
         </>
       )}
 
@@ -370,7 +426,7 @@ export default function PriorCalibrationView() {
 
       {/* SVI parameter sliders */}
       {sviParams && (
-        <div style={{ borderTop: "1px solid #334155", marginTop: 8, paddingTop: 8 }}>
+        <div style={{ padding: "0 16px", borderTop: "1px solid #334155", marginTop: 4, paddingTop: 8 }}>
           <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
             SVI Parameters
           </div>
@@ -385,6 +441,21 @@ export default function PriorCalibrationView() {
     </div>
   );
 }
+
+const fwdNudgeBtn: React.CSSProperties = {
+  width: 16,
+  height: 16,
+  padding: 0,
+  fontSize: 11,
+  lineHeight: "14px",
+  textAlign: "center",
+  background: "#1e293b",
+  color: "#94a3b8",
+  border: "1px solid #334155",
+  borderRadius: 3,
+  cursor: "pointer",
+  flexShrink: 0,
+};
 
 const actionBtnStyle: React.CSSProperties = {
   fontSize: 11,

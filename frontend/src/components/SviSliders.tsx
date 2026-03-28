@@ -58,16 +58,18 @@ const PARAM_DEFS: ParamDef[] = [
 export default function SviSliders({ values, baseValues, onChange, onReset }: Props) {
   const base = baseValues ?? values;
 
-  // Compute slider ranges centered on the base (fitted) values
+  // Compute slider ranges centered on the base (fitted) values,
+  // expanded to always include the current value
   const ranges = useMemo(() => {
     return PARAM_DEFS.map((def) => {
       const center = base[def.key];
-      const lo = Math.max(def.hardMin, center - def.halfWidth);
-      const hi = Math.min(def.hardMax, center + def.halfWidth);
+      const cur = values[def.key];
+      const lo = Math.max(def.hardMin, Math.min(center - def.halfWidth, cur - def.halfWidth * 0.1));
+      const hi = Math.min(def.hardMax, Math.max(center + def.halfWidth, cur + def.halfWidth * 0.1));
       const step = (hi - lo) / def.nSteps;
       return { ...def, min: lo, max: hi, step: Math.max(step, 1e-8) };
     });
-  }, [base]);
+  }, [base, values]);
 
   const valRef = useRef(values);
   const onChangeRef = useRef(onChange);

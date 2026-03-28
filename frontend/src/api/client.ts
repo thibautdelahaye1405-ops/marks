@@ -8,6 +8,7 @@ import type {
   GraphData,
   DistributionView,
   NodeDistributionResponse,
+  SmileData,
 } from "../types";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -116,5 +117,30 @@ export const api = {
       chain_snapshot: QuoteSnapshot | null;
     }>(`/priors/load/${ticker}`, {
       method: "POST",
+    }),
+
+  // Rates & forwards
+  getTreasuryCurve: () =>
+    request<{ date: string; tenors: number[]; rates: number[] }>("/rates/treasury"),
+
+  getRatesConfig: () =>
+    request<{ repo_rate_gc: number; repo_overrides: Record<string, number> }>("/rates/config"),
+
+  updateRatesConfig: (config: { repo_rate_gc: number; repo_overrides: Record<string, number> }) =>
+    request<{ status: string }>("/rates/config", {
+      method: "PUT",
+      body: JSON.stringify(config),
+    }),
+
+  setForwardOverride: (ticker: string, forward: number | null) =>
+    request<{ status: string; ticker: string; forward: number; forward_model: number; forward_parity: number | null }>(
+      `/forward/${ticker}`,
+      { method: "PUT", body: JSON.stringify({ forward }) },
+    ),
+
+  setPriorForwardOverride: (ticker: string, forward: number | null) =>
+    request<{ status: string }>(`/forward/${ticker}/prior`, {
+      method: "PUT",
+      body: JSON.stringify({ forward }),
     }),
 };
