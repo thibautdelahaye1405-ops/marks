@@ -1,0 +1,201 @@
+\documentclass[11pt, a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+
+% Customizing the Python code block appearance
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=4
+}
+\lstset{style=mystyle}
+
+% Custom math operator for secant hyperbolic
+\DeclareMathOperator{\sech}{sech}
+
+\title{\textbf{Model Documentation: Sigmoid-Implied Variance (SIV) Calibration}}
+\author{Quantitative Research / Volatility Modeling}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Design Philosophy \& Space Definition}
+The objective of this model is to provide a $C^2$-continuous implied variance curve driven by 6 orthogonal, trader-intuitive parameters. The core engine utilizes the derivatives of the Sigmoid function to control convexity. Because the derivative of a Sigmoid naturally forms a bell-shaped curve, it concentrates convexity around the At-The-Money (ATM) region and smoothly decays it to zero at the tails. This naturally forces the variance asymptotes to become linear, perfectly satisfying Lee's Moment Formula.
+
+\subsection*{Space Normalization}
+We operate in the dimensionless log-strike space:
+\begin{equation}
+z = \frac{1}{\sigma_{\text{ref}} \sqrt{T}} \ln\left(\frac{K}{F}\right)
+\end{equation}
+\textit{(Where $\sigma_{\text{ref}}$ is typically the ATM volatility $\sigma_{\text{ATM}}$).}
+
+\section{Mathematical Formulation}
+Instead of defining the variance $V(z)$ directly, we build the model from the ``inside out'' by modeling the \textbf{Convexity} (second derivative) as a piecewise Sigmoid derivative ($\sech^2$), allowing for asymmetric wings. Let $z_0$ be the ``structural center'' (the peak of the convexity).
+
+\subsection{The Convexity (Second Derivative)}
+\begin{equation}
+V''(z) = K_0 \sech^2\left(\frac{\kappa_i (z - z_0)}{2}\right)
+\end{equation}
+Where $\kappa_i$ defines the transition speed. To allow for asymmetric skew and wings, we define $\kappa_i = \kappa_P$ for $z < z_0$ (Put side) and $\kappa_i = \kappa_C$ for $z \ge z_0$ (Call side). $K_0$ is the peak structural kurtosis.
+
+\subsection{The Skew (First Derivative)}
+Integrating the convexity yields the slope of the variance:
+\begin{equation}
+V'(z) = S_0 + \frac{2K_0}{\kappa_i} \tanh\left(\frac{\kappa_i (z - z_0)}{2}\right)
+\end{equation}
+
+\subsection{The Implied Variance}
+Integrating once more yields the exact closed-form variance:
+\begin{equation}
+V(z) = V_0 + S_0(z - z_0) + \frac{4K_0}{\kappa_i^2} \ln \cosh \left(\frac{\kappa_i (z - z_0)}{2}\right)
+\end{equation}
+\textit{Implementation Note: For $|x| \gg 0$, $\ln \cosh(x)$ should be approximated as $|x| - \ln(2)$ to prevent floating-point overflow in production.}
+
+\section{Parameter Separability: Trader Space vs. Structural Space}
+To achieve true orthogonality (separability) from a trader's viewpoint, we must divorce the \textbf{Trader Parameters} from the \textbf{Structural Parameters}.
+
+\subsection{The 6 Trader Parameters (Inputs)}
+\begin{enumerate}
+    \item $V_{\text{ATM}}$: ATM Variance Level $\to V(0)$
+    \item $S_{\text{ATM}}$: ATM Skew $\to V'(0)$
+    \item $K_{\text{ATM}}$: ATM Kurtosis/Convexity $\to V''(0)$
+    \item $W_P$: Put-wing slope (absolute asymptote as $z \to -\infty$)
+    \item $W_C$: Call-wing slope (asymptote as $z \to +\infty$)
+    \item $V_{\text{min}}$: Absolute minimum variance level
+\end{enumerate}
+
+\subsection{The 6 Structural Parameters (Engine)}
+The mathematical engine relies on: $V_0, S_0, K_0, z_0, \kappa_P, \kappa_C$.
+
+\subsection{The Orthogonal Mapping}
+We link the two spaces by explicitly solving a mapping system. The asymptotes explicitly define the transition speeds:
+\begin{align}
+\kappa_P &= \frac{2K_0}{S_0 + W_P} \\
+\kappa_C &= \frac{2K_0}{W_C - S_0}
+\end{align}
+
+This leaves a 4-dimensional system $(V_0, S_0, K_0, z_0)$ to be resolved via a fast Jacobian root-finder against the 4 remaining trader constraints: $V(0) = V_{\text{ATM}}$, $V'(0) = S_{\text{ATM}}$, $V''(0) = K_{\text{ATM}}$, and $\min V(z) = V_{\text{min}}$.
+
+\section{Proof of Lee's Constraints}
+To verify that the model prevents calendar arbitrage and respects Lee's bounds at extreme strikes, we examine the limit as $z \to \infty$ (Call wing). As $z \to \infty$, $\ln \cosh(x) \approx x - \ln(2)$. Substituting this:
+\begin{equation}
+V(z) \approx V_0 + S_0(z - z_0) + \frac{4K_0}{\kappa_C^2} \left[ \frac{\kappa_C (z - z_0)}{2} - \ln 2 \right]
+\end{equation}
+\begin{equation}
+V(z) \approx \left( S_0 + \frac{2K_0}{\kappa_C} \right) z + \text{Constant}
+\end{equation}
+From our mapping, $S_0 + \frac{2K_0}{\kappa_C} = W_C$. Therefore:
+\begin{equation}
+V(z) \approx W_C \cdot z + \text{Constant}
+\end{equation}
+The variance grows strictly linearly with respect to $z$, directly satisfying Lee's constraint.
+
+\newpage
+\section{Python Implementation: Structural Mapping}
+The following Python code utilizes \texttt{scipy.optimize.least\_squares} to dynamically map the trader inputs to the structural engine parameters.
+
+\begin{lstlisting}[language=Python, caption=SIV Calibration Engine]
+import numpy as np
+from scipy.optimize import least_squares
+
+class SIVModel:
+    def __init__(self, v_atm, s_atm, k_atm, w_p, w_c, v_min):
+        self.v_atm = v_atm
+        self.s_atm = s_atm
+        self.k_atm = k_atm
+        self.w_p = w_p
+        self.w_c = w_c
+        self.v_min = v_min
+        
+        # Will hold the resolved structural params [V0, S0, K0, z0]
+        self.struct_params = None 
+
+    def _safe_logcosh(self, x):
+        """Prevents overflow for large x."""
+        return np.where(np.abs(x) < 50, np.log(np.cosh(x)), np.abs(x) - np.log(2.0))
+
+    def _get_kappa(self, S0, K0, z):
+        """Returns piecewise transition speed."""
+        kappa_P = 2 * K0 / (S0 + self.w_p)
+        kappa_C = 2 * K0 / (self.w_c - S0)
+        return np.where(z < 0, kappa_P, kappa_C)
+
+    def _residuals(self, x):
+        """Calculates differences between Trader targets and current Structural state."""
+        V0, S0, K0, z0 = x
+        
+        # Calculate kappas
+        kappa_P = 2 * K0 / (S0 + self.w_p)
+        kappa_C = 2 * K0 / (self.w_c - S0)
+        
+        # Assume z=0 (ATM) side logic (simplified handling)
+        kappa_atm = kappa_P if 0 < z0 else kappa_C
+        
+        # Constraint 1: V(0) = V_atm
+        arg_atm = kappa_atm * (-z0) / 2.0
+        v_0_est = V0 + S0*(-z0) + (4*K0/(kappa_atm**2)) * self._safe_logcosh(arg_atm)
+        res_v = v_0_est - self.v_atm
+        
+        # Constraint 2: V'(0) = S_atm
+        s_0_est = S0 + (2*K0/kappa_atm) * np.tanh(arg_atm)
+        res_s = s_0_est - self.s_atm
+        
+        # Constraint 3: V''(0) = K_atm
+        k_0_est = K0 * (1.0 / np.cosh(arg_atm))**2
+        res_k = k_0_est - self.k_atm
+        
+        # Constraint 4: V_min approx (simplification: evaluating at z_min derived from S(z)=0)
+        # For production, exact min V(z) search goes here.
+        # We approximate V_min penalty here for brevity.
+        res_vmin = V0 - self.v_min 
+        
+        return [res_v, res_s, res_k, res_vmin]
+
+    def calibrate(self):
+        """Runs the solver to find structural parameters."""
+        # Initial guess: V0~V_atm, S0~S_atm, K0~K_atm, z0~0
+        x0 = [self.v_atm, self.s_atm, self.k_atm, 0.0]
+        
+        # Using least_squares with bounds to ensure physical sensibility
+        bounds = (
+            [self.v_min, -self.w_p, 1e-4, -5.0],  # Lower bounds
+            [np.inf, self.w_c, np.inf, 5.0]       # Upper bounds
+        )
+        
+        result = least_squares(self._residuals, x0, bounds=bounds, method='trf')
+        if result.success:
+            self.struct_params = result.x
+            print(f"Calibration successful: V0={result.x[0]:.4f}, S0={result.x[1]:.4f}, K0={result.x[2]:.4f}, z0={result.x[3]:.4f}")
+        else:
+            print("Calibration failed.")
+            
+        return self.struct_params
+\end{lstlisting}
+
+\end{document}

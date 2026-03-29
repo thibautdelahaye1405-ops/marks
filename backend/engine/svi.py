@@ -127,8 +127,19 @@ def jw_normalized_to_raw_svi(v: float, vt_ratio: float, psi_hat: float,
     return {"a": a, "b": b, "rho": rho, "m": m, "sigma": sigma}
 
 
+# Dense grid of candidate log-moneyness points for virtual prior data points.
+# Covers a wide range including wing extrapolation.  At fit time, only grid
+# points far from any observed quote are kept — the prior fills gaps, not
+# competes with data.
+_PRIOR_K_CANDIDATES = np.linspace(-0.30, 0.30, 15)
+
+
 def fit_svi(strikes: np.ndarray, mid_ivs: np.ndarray, forward: float, T: float,
-            weights: np.ndarray = None) -> dict:
+            weights: np.ndarray = None, *,
+            bid_ask_spread: np.ndarray = None,
+            use_bid_ask_fit: bool = True,
+            prior_params: np.ndarray = None,
+            lambda_prior: float = 0.0) -> dict:
     """
     Fit raw SVI to market implied vols.
 
@@ -138,6 +149,16 @@ def fit_svi(strikes: np.ndarray, mid_ivs: np.ndarray, forward: float, T: float,
         forward:  forward price
         T:        time to maturity
         weights:  optional fitting weights, shape (n,)
+        bid_ask_spread: half bid-ask spread in vol points, shape (n,).
+                        When provided and use_bid_ask_fit=True, the fit uses a
+                        dead-zone loss that is zero inside the spread.
+                        If None, treated as zero (bid=ask=mid).
+        use_bid_ask_fit: whether to use bid-ask dead-zone (default True).
+        prior_params: prior SVI parameters [a, b, rho, m, sigma] to anchor to.
+        lambda_prior: strength of prior-anchoring penalty (0 = pure market fit).
+                      The penalty adds virtual data points from the prior smile
+                      in total variance space, so lambda=1 means each virtual
+                      prior point carries the same weight as one market quote.
 
     Returns:
         dict with keys: a, b, rho, m, sigma, iv_fitted, residuals
@@ -154,32 +175,103 @@ def fit_svi(strikes: np.ndarray, mid_ivs: np.ndarray, forward: float, T: float,
 
     k_v = k[valid]
     w_v = w_market[valid]
+
+    # Weights: flat when using bid-ask dead-zone (spread already encodes noise),
+    # ATM-focused otherwise (de-emphasise noisy deep OTM quotes).
     if weights is not None:
         wt = weights[valid]
+    elif use_bid_ask_fit and bid_ask_spread is not None:
+        wt = np.ones_like(k_v)
     else:
-        # Weight by proximity to ATM: near-ATM gets weight 1, deep OTM gets weight ~0.3
         wt = 1.0 / (1.0 + 10.0 * k_v ** 2)
 
-    # Initial guess from data
+    # Bid-ask dead-zone bounds in total variance space
+    if use_bid_ask_fit and bid_ask_spread is not None:
+        ba = bid_ask_spread[valid]
+        bid_ivs = np.maximum(mid_ivs[valid] - ba, 0.001)
+        ask_ivs = mid_ivs[valid] + ba
+        w_bid = bid_ivs ** 2 * T
+        w_ask = ask_ivs ** 2 * T
+    else:
+        # No spread info → bid=ask=mid (degrades to current behaviour)
+        w_bid = w_v
+        w_ask = w_v
+
+    # Prior anchoring: evaluate the prior SVI on virtual data points in total
+    # variance space.  Only place virtual points where there is no nearby market
+    # observation — the prior fills gaps (wings, sparse regions), not competes
+    # with actual quotes.
+    #
+    # The prior is rescaled to match the market ATM level, so only SHAPE
+    # (skew, wings, curvature) is anchored — level is always driven by data.
+    use_prior = prior_params is not None and lambda_prior > 0.0
+    if use_prior:
+        a_p, b_p, rho_p, m_p, sig_p = prior_params
+        # Keep only candidate grid points far from any observed k
+        min_gap = np.median(np.diff(np.sort(k_v))) * 0.5 if len(k_v) > 1 else 0.02
+        dists = np.abs(_PRIOR_K_CANDIDATES[:, None] - k_v[None, :]).min(axis=1)
+        prior_k_grid = _PRIOR_K_CANDIDATES[dists > min_gap]
+
+        if len(prior_k_grid) == 0:
+            # All grid points covered by data — no virtual points needed
+            use_prior = False
+        else:
+            w_prior_raw = svi_total_variance(prior_k_grid, a_p, b_p, rho_p, m_p, sig_p)
+            w_prior_atm = svi_total_variance(np.array([0.0]), a_p, b_p, rho_p, m_p, sig_p)[0]
+            atm_idx_data = np.argmin(np.abs(k_v))
+            w_market_atm = w_v[atm_idx_data]
+            level_ratio = w_market_atm / max(w_prior_atm, 1e-8)
+            w_prior_grid = w_prior_raw * level_ratio
+
+    # Initial guess: start from prior shape with market level, else from data
     atm_idx = np.argmin(np.abs(k_v))
-    a0 = float(w_v[atm_idx])
-    b0 = 0.1
-    rho0 = -0.5  # typical equity skew
-    m0 = 0.0
-    sigma0 = 0.1
+    if use_prior:
+        # Use prior shape params but shift level to match market ATM
+        w_prior_atm = svi_total_variance(np.array([0.0]), a_p, b_p, rho_p, m_p, sig_p)[0]
+        a_shifted = a_p + (w_v[atm_idx] - w_prior_atm)
+        a0 = float(np.clip(a_shifted, 1e-6, 0.099))
+        b0 = float(np.clip(b_p, 1e-6, 0.499))
+        rho0 = float(np.clip(rho_p, -0.989, 0.989))
+        m0 = float(np.clip(m_p, -0.199, 0.199))
+        sigma0 = float(np.clip(sig_p, 0.01, 0.999))
+    else:
+        a0 = float(w_v[atm_idx])
+        b0 = 0.1
+        rho0 = -0.5  # typical equity skew
+        m0 = 0.0
+        sigma0 = 0.1
 
     def residuals(params):
         a, b, rho, m_s, sig = params
         sig = max(sig, 1e-4)
         w_fit = svi_total_variance(k_v, a, b, rho, m_s, sig)
-        return wt * (w_fit - w_v)
+
+        # Dead-zone residuals: zero inside [w_bid, w_ask]
+        data_resid = np.where(
+            w_fit < w_bid, wt * (w_fit - w_bid),
+            np.where(w_fit > w_ask, wt * (w_fit - w_ask), 0.0)
+        )
+
+        if not use_prior:
+            return data_resid
+
+        # Prior penalty: virtual data points from prior SVI, same units as data.
+        # lambda=1 ⇒ each virtual point has the same weight as one real quote.
+        w_fit_grid = svi_total_variance(prior_k_grid, a, b, rho, m_s, sig)
+        prior_resid = np.sqrt(lambda_prior) * (w_fit_grid - w_prior_grid)
+
+        # Small parameter-space nudge to break SVI identifiability degeneracy
+        # (prevents rho-flip / sigma-collapse to piecewise-linear regime).
+        # Scale: ~1% of a typical data residual, so it only matters as tiebreaker.
+        param_nudge = 1e-4 * np.sqrt(lambda_prior) * (np.array(params) - prior_params)
+        return np.concatenate([data_resid, prior_resid, param_nudge])
 
     try:
         result = least_squares(
             residuals,
             x0=[a0, b0, rho0, m0, sigma0],
             bounds=(
-                [0.0,   0.0,  -0.99, -0.2, 1e-4],   # lower
+                [0.0,   0.0,  -0.99, -0.2, 0.01],   # lower — sigma≥0.01 prevents degenerate V-shapes
                 [0.1,   0.5,   0.99,  0.2, 1.0],     # upper — tighter b cap prevents blowup
             ),
             method='trf',

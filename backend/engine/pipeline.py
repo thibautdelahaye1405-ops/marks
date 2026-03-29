@@ -304,9 +304,19 @@ def run_marking(
         p = priors[ticker]
         svi_prior = p.get("_svi_params")
 
-        filt_k, filt_iv, _ = filter_quotes_for_fit(q.strikes, q.mid_ivs, q.forward)
+        filt_k, filt_iv, filt_mask = filter_quotes_for_fit(q.strikes, q.mid_ivs, q.forward)
         if len(filt_k) >= 5:
-            market_svi = fit_svi(filt_k, filt_iv, q.forward, q.T)
+            # Build fit kwargs from config
+            fit_kw = dict(
+                bid_ask_spread=q.bid_ask_spread[filt_mask] if q.bid_ask_spread is not None else None,
+                use_bid_ask_fit=config.use_bid_ask_fit,
+                lambda_prior=config.lambda_prior,
+            )
+            if svi_prior and config.lambda_prior > 0:
+                fit_kw["prior_params"] = np.array([svi_prior["a"], svi_prior["b"],
+                                                    svi_prior["rho"], svi_prior["m"],
+                                                    svi_prior["sigma"]])
+            market_svi = fit_svi(filt_k, filt_iv, q.forward, q.T, **fit_kw)
             obs_svi_fitted[ticker] = market_svi
 
             # Convert both market and prior to normalized JW

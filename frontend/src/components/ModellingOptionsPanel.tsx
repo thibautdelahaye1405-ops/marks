@@ -25,7 +25,7 @@ function HoldButton({ onAction, children, style }: {
 }
 
 export default function ModellingOptionsPanel() {
-  const { lambda, eta, setLambda, setEta } = useEngine();
+  const { lambda, eta, lambdaPrior, useBidAskFit, smileModel, setLambda, setEta, setLambdaPrior, setUseBidAskFit, setSmileModel } = useEngine();
 
   const [repoGc, setRepoGc] = useState(0.0);
   const [treasuryCurve, setTreasuryCurve] = useState<{ date: string; tenors: number[]; rates: number[] } | null>(null);
@@ -53,8 +53,10 @@ export default function ModellingOptionsPanel() {
   // Use refs so HoldButton interval always reads the latest value
   const lambdaRef = useRef(lambda);
   const etaRef = useRef(eta);
+  const lambdaPriorRef = useRef(lambdaPrior);
   lambdaRef.current = lambda;
   etaRef.current = eta;
+  lambdaPriorRef.current = lambdaPrior;
 
   const nudgeLambda = useCallback((dir: number) => {
     const logVal = Math.log10(lambdaRef.current) + dir * logStep;
@@ -68,6 +70,12 @@ export default function ModellingOptionsPanel() {
     const clamped = Math.pow(10, Math.max(-4, Math.min(-1, logVal)));
     etaRef.current = clamped;
     useEngine.getState().setEta(clamped);
+  }, []);
+
+  const nudgeLambdaPrior = useCallback((dir: number) => {
+    const next = Math.max(0, Math.min(0.5, lambdaPriorRef.current + dir * 0.05));
+    lambdaPriorRef.current = next;
+    useEngine.getState().setLambdaPrior(next);
   }, []);
 
   return (
@@ -129,6 +137,45 @@ export default function ModellingOptionsPanel() {
         </label>
       </div>
 
+      {/* Smile Fit */}
+      <div>
+        <div style={sectionTitle}>Smile Fit</div>
+        <label style={labelStyle}>
+          <span style={labelText}>
+            {"\u03BB"}<sub>prior</sub> {lambdaPrior.toFixed(2)}
+          </span>
+          <div style={sliderRow}>
+            <HoldButton onAction={() => nudgeLambdaPrior(-1)} style={nudgeBtn}>
+              {"\u2212"}
+            </HoldButton>
+            <input
+              type="range"
+              min={0}
+              max={0.5}
+              step={0.05}
+              value={lambdaPrior}
+              onChange={(e) =>
+                setLambdaPrior(parseFloat(e.target.value))
+              }
+              style={sliderStyle}
+            />
+            <HoldButton onAction={() => nudgeLambdaPrior(1)} style={nudgeBtn}>
+              +
+            </HoldButton>
+          </div>
+          <span style={rangeHint}>0 -- 0.5 (prior shape anchoring in gaps)</span>
+        </label>
+        <label style={{ ...toggleLabel, marginTop: 12 }}>
+          <input
+            type="checkbox"
+            checked={useBidAskFit}
+            onChange={(e) => setUseBidAskFit(e.target.checked)}
+            style={{ accentColor: "#6366f1" }}
+          />
+          <span style={{ color: "#cbd5e1", fontSize: 12 }}>Bid-ask dead-zone penalty</span>
+        </label>
+      </div>
+
       {/* Forwards & Rates */}
       <div>
         <div style={sectionTitle}>Forwards & Rates</div>
@@ -171,20 +218,22 @@ export default function ModellingOptionsPanel() {
               type="radio"
               name="smileModel"
               value="svi"
-              defaultChecked
+              checked={smileModel === "svi"}
+              onChange={() => setSmileModel("svi")}
               style={radioStyle}
             />
             <span style={{ color: "#e2e8f0" }}>SVI</span>
           </label>
-          <label style={{ ...radioLabel, opacity: 0.4 }}>
+          <label style={radioLabel}>
             <input
               type="radio"
               name="smileModel"
               value="lqd"
-              disabled
+              checked={smileModel === "lqd"}
+              onChange={() => setSmileModel("lqd")}
               style={radioStyle}
             />
-            <span style={{ color: "#94a3b8" }}>LQD</span>
+            <span style={{ color: "#e2e8f0" }}>LQD</span>
           </label>
           <label style={{ ...radioLabel, opacity: 0.4 }}>
             <input
@@ -260,6 +309,13 @@ const nudgeBtn: React.CSSProperties = {
   borderRadius: 4,
   cursor: "pointer",
   flexShrink: 0,
+};
+
+const toggleLabel: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  cursor: "pointer",
 };
 
 const radioLabel: React.CSSProperties = {

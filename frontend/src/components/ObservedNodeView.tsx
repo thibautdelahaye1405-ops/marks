@@ -1,8 +1,11 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { api } from "../api/client";
 import { useEngine } from "../hooks/useEngine";
 import DistributionTripleView from "./DistributionTripleView";
 import SmileView from "./SmileView";
+import SviSliders from "./SviSliders";
+import LqdSliders from "./LqdSliders";
+import type { LqdTraderParams } from "./LqdSliders";
 import type { NodeDistributionResponse, SmileData, QuoteSnapshot } from "../types";
 
 type ViewMode = "smile" | "distributions";
@@ -17,6 +20,7 @@ export default function ObservedNodeView({ ticker, smileData, quoteData }: Props
   const {
     excludedQuotes, resetExclusions,
     addedQuotes, resetAdditions,
+    smileModel,
   } = useEngine();
   const [distData, setDistData] = useState<NodeDistributionResponse | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("smile");
@@ -78,11 +82,35 @@ export default function ObservedNodeView({ ticker, smileData, quoteData }: Props
           <DistributionTripleView
             prior={distData.prior}
             current={distData.marked}
-            priorLabel="Prior"
-            currentLabel="Marked"
+            priorLabel={`Prior (${smileModel.toUpperCase()})`}
+            currentLabel={`Marked (${smileModel.toUpperCase()})`}
             currentColor="#3b82f6"
             height={165}
           />
+          {/* Model-aware sliders below distributions */}
+          {smileData?.is_observed && smileData.beta && smileModel === "lqd" && smileData.beta.length >= 6 && (
+            <div style={{ borderTop: "1px solid #334155", marginTop: 8, paddingTop: 8 }}>
+              <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>LQD Parameters ({"\u03B8"})</div>
+              <LqdSliders
+                values={{ min_iv: smileData.beta[0], atm_skew: smileData.beta[1], atm_curv: smileData.beta[2], put_slope: smileData.beta[3], call_slope: smileData.beta[4], shoulder: smileData.beta[5] }}
+                onChange={(params) => {
+                  const theta = [params.min_iv, params.atm_skew, params.atm_curv, params.put_slope, params.call_slope, params.shoulder];
+                  api.lqdOverrideSmile(ticker, theta).catch(() => {});
+                }}
+              />
+            </div>
+          )}
+          {smileData?.is_observed && smileData.beta && smileModel === "svi" && smileData.beta.length >= 5 && (
+            <div style={{ borderTop: "1px solid #334155", marginTop: 8, paddingTop: 8 }}>
+              <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>SVI-JW Parameters</div>
+              <SviSliders
+                values={{ v: smileData.beta[0], psi_hat: smileData.beta[1], p_hat: smileData.beta[2], c_hat: smileData.beta[3], vt_ratio: smileData.beta[4] }}
+                onChange={(params) => {
+                  api.sviOverrideSmile(ticker, params).catch(() => {});
+                }}
+              />
+            </div>
+          )}
         </div>
       )}
 

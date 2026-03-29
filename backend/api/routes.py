@@ -309,6 +309,123 @@ def get_latest_quotes():
     return results
 
 
+def _fit_single_ticker(ticker: str, chain, prior, req: FitRequest, is_observed: bool) -> SmileData:
+    """Fit a single ticker's smile. Shared logic for /fit and /fit/{ticker}."""
+    from ..engine.svi import fit_svi, svi_iv_at_strikes, filter_quotes_for_fit
+
+    smile_model = req.smile_model if hasattr(req, 'smile_model') else "svi"
+
+    svi_prior = prior.get("_svi_params") if prior else None
+    strikes = chain.strikes
+    forward = chain.forward
+    T = chain.T
+
+    # Prior IV
+    if svi_prior:
+        iv_prior = svi_iv_at_strikes(svi_prior, strikes, forward, T)
+        iv_prior = np.clip(iv_prior, 0.01, 5.0)
+    else:
+        iv_prior = np.full(len(strikes), chain.atm_iv)
+
+    if is_observed:
+        # Observed: SVI fit to current market quotes (with exclusions/additions)
+        fit_strikes = chain.strikes.copy()
+        fit_ivs = chain.mid_ivs.copy()
+        fit_spread = chain.bid_ask_spread.copy()
+
+        # Apply exclusions
+        if req.excluded_quotes and ticker in req.excluded_quotes:
+            keep = np.ones(len(fit_strikes), dtype=bool)
+            for idx in req.excluded_quotes[ticker]:
+                if 0 <= idx < len(keep):
+                    keep[idx] = False
+            fit_strikes = fit_strikes[keep]
+            fit_ivs = fit_ivs[keep]
+            fit_spread = fit_spread[keep]
+
+        # Apply additions
+        if req.added_quotes and ticker in req.added_quotes:
+            med_spread = np.median(fit_spread) if len(fit_spread) > 0 else 0.01
+            for pt in req.added_quotes[ticker]:
+                if len(pt) >= 2:
+                    fit_strikes = np.append(fit_strikes, pt[0])
+                    fit_ivs = np.append(fit_ivs, pt[1])
+                    fit_spread = np.append(fit_spread, med_spread)
+            order = np.argsort(fit_strikes)
+            fit_strikes = fit_strikes[order]
+            fit_ivs = fit_ivs[order]
+            fit_spread = fit_spread[order]
+
+        # Prior params for anchoring
+        prior_params = None
+        if svi_prior and req.lambda_prior > 0:
+            prior_params = np.array([svi_prior["a"], svi_prior["b"], svi_prior["rho"],
+                                     svi_prior["m"], svi_prior["sigma"]])
+
+        filt_k, filt_iv, filt_mask = filter_quotes_for_fit(fit_strikes, fit_ivs, forward)
+        filt_spread = fit_spread[filt_mask] if len(fit_spread) == len(fit_strikes) else None
+        if len(filt_k) >= 5:
+            if smile_model == "svi":
+                market_svi = fit_svi(filt_k, filt_iv, forward, T,
+                                     bid_ask_spread=filt_spread,
+                                     use_bid_ask_fit=req.use_bid_ask_fit,
+                                     prior_params=prior_params,
+                                     lambda_prior=req.lambda_prior)
+                iv_marked = svi_iv_at_strikes(market_svi, strikes, forward, T)
+                iv_marked = np.clip(iv_marked, 0.01, 5.0)
+                from ..engine.svi import raw_svi_to_jw_normalized
+                jw = raw_svi_to_jw_normalized(market_svi["a"], market_svi["b"], market_svi["rho"],
+                                              market_svi["m"], market_svi["sigma"], T)
+                svi_beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
+            elif smile_model == "lqd":
+                from ..engine.lqd_model import fit_lqd_model, lqd_iv_at_strikes
+                prior_theta = None
+                if prior and req.lambda_prior > 0:
+                    prior_theta = prior.get("_lqd_theta")
+                    if prior_theta is not None:
+                        prior_theta = np.array(prior_theta)
+                lqd_result = fit_lqd_model(filt_k, filt_iv, forward, T,
+                                           bid_ask_spread=filt_spread,
+                                           use_bid_ask_fit=req.use_bid_ask_fit,
+                                           prior_theta=prior_theta,
+                                           lambda_prior=req.lambda_prior,
+                                           atm_iv=chain.atm_iv)
+                iv_marked = lqd_iv_at_strikes(lqd_result["theta"], strikes, forward, T, lqd_result["alpha"])
+                iv_marked = np.clip(np.where(np.isfinite(iv_marked), iv_marked, chain.atm_iv), 0.01, 5.0)
+                svi_beta = lqd_result["theta"].tolist()
+                # pad to match expected length if needed
+                if len(svi_beta) < 6:
+                    svi_beta.extend([0.0] * (6 - len(svi_beta)))
+        else:
+            iv_marked = iv_prior.copy()
+            svi_beta = [0.04, 0.0, 0.5, 0.5, 1.0]
+    else:
+        # Unobserved: show prior as current smile
+        iv_marked = iv_prior.copy()
+        jw_prior = prior.get("_jw_params") if prior else None
+        if jw_prior:
+            svi_beta = [jw_prior["v"], jw_prior["psi_hat"], jw_prior["p_hat"], jw_prior["c_hat"], jw_prior["vt_ratio"]]
+        elif svi_prior:
+            from ..engine.svi import raw_svi_to_jw_normalized
+            jw = raw_svi_to_jw_normalized(svi_prior["a"], svi_prior["b"], svi_prior["rho"],
+                                          svi_prior["m"], svi_prior["sigma"], svi_prior.get("T", T))
+            svi_beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
+        else:
+            svi_beta = [0.04, 0.0, 0.5, 0.5, 1.0]
+
+    iv_prior_list = [float(v) if np.isfinite(v) else None for v in iv_prior]
+    iv_marked_list = [float(v) if np.isfinite(v) else None for v in iv_marked]
+
+    return SmileData(
+        ticker=ticker,
+        strikes=strikes.tolist(),
+        iv_prior=iv_prior_list,
+        iv_marked=iv_marked_list,
+        beta=svi_beta,
+        is_observed=is_observed,
+    )
+
+
 @router.post("/fit")
 def fit_endpoint(req: FitRequest):
     """Lightweight fit: SVI for observed assets, prior for unobserved.
@@ -319,8 +436,6 @@ def fit_endpoint(req: FitRequest):
     """
     if not _state["quotes"]:
         raise HTTPException(status_code=400, detail="No quotes loaded.")
-
-    from ..engine.svi import fit_svi, svi_iv_at_strikes, filter_quotes_for_fit
 
     universe = get_universe()
     tickers = [a.ticker for a in universe]
@@ -333,84 +448,35 @@ def fit_endpoint(req: FitRequest):
             continue
 
         prior = _state["priors"].get(ticker) if _state.get("priors") else None
-        svi_prior = prior.get("_svi_params") if prior else None
-        strikes = chain.strikes
-        forward = chain.forward
-        T = chain.T
-
-        # Prior IV
-        if svi_prior:
-            iv_prior = svi_iv_at_strikes(svi_prior, strikes, forward, T)
-            iv_prior = np.clip(iv_prior, 0.01, 5.0)
-        else:
-            iv_prior = np.full(len(strikes), chain.atm_iv)
-
-        if ticker in observed_set:
-            # Observed: SVI fit to current market quotes (with exclusions/additions)
-            fit_strikes = chain.strikes.copy()
-            fit_ivs = chain.mid_ivs.copy()
-
-            # Apply exclusions
-            if req.excluded_quotes and ticker in req.excluded_quotes:
-                keep = np.ones(len(fit_strikes), dtype=bool)
-                for idx in req.excluded_quotes[ticker]:
-                    if 0 <= idx < len(keep):
-                        keep[idx] = False
-                fit_strikes = fit_strikes[keep]
-                fit_ivs = fit_ivs[keep]
-
-            # Apply additions
-            if req.added_quotes and ticker in req.added_quotes:
-                for pt in req.added_quotes[ticker]:
-                    if len(pt) >= 2:
-                        fit_strikes = np.append(fit_strikes, pt[0])
-                        fit_ivs = np.append(fit_ivs, pt[1])
-                order = np.argsort(fit_strikes)
-                fit_strikes = fit_strikes[order]
-                fit_ivs = fit_ivs[order]
-
-            filt_k, filt_iv, _ = filter_quotes_for_fit(fit_strikes, fit_ivs, forward)
-            if len(filt_k) >= 5:
-                market_svi = fit_svi(filt_k, filt_iv, forward, T)
-                iv_marked = svi_iv_at_strikes(market_svi, strikes, forward, T)
-                iv_marked = np.clip(iv_marked, 0.01, 5.0)
-                from ..engine.svi import raw_svi_to_jw_normalized
-                jw = raw_svi_to_jw_normalized(market_svi["a"], market_svi["b"], market_svi["rho"],
-                                              market_svi["m"], market_svi["sigma"], T)
-                svi_beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
-            else:
-                iv_marked = iv_prior.copy()
-                svi_beta = [0.04, 0.0, 0.5, 0.5, 1.0]
-        else:
-            # Unobserved: show prior as current smile
-            iv_marked = iv_prior.copy()
-            jw_prior = prior.get("_jw_params") if prior else None
-            if jw_prior:
-                svi_beta = [jw_prior["v"], jw_prior["psi_hat"], jw_prior["p_hat"], jw_prior["c_hat"], jw_prior["vt_ratio"]]
-            elif svi_prior:
-                from ..engine.svi import raw_svi_to_jw_normalized
-                jw = raw_svi_to_jw_normalized(svi_prior["a"], svi_prior["b"], svi_prior["rho"],
-                                              svi_prior["m"], svi_prior["sigma"], svi_prior.get("T", T))
-                svi_beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
-            else:
-                svi_beta = [0.04, 0.0, 0.5, 0.5, 1.0]
-
-        iv_prior_list = [float(v) if np.isfinite(v) else None for v in iv_prior]
-        iv_marked_list = [float(v) if np.isfinite(v) else None for v in iv_marked]
-
-        nodes_resp[ticker] = SmileData(
-            ticker=ticker,
-            strikes=strikes.tolist(),
-            iv_prior=iv_prior_list,
-            iv_marked=iv_marked_list,
-            beta=svi_beta,
-            is_observed=(ticker in observed_set),
-        )
+        is_observed = ticker in observed_set
+        nodes_resp[ticker] = _fit_single_ticker(ticker, chain, prior, req, is_observed)
 
     return {
         "nodes": {t: n.dict() for t, n in nodes_resp.items()},
         "tickers": list(nodes_resp.keys()),
     }
+
+
+@router.post("/fit/{ticker}")
+def fit_single(ticker: str, req: FitRequest):
+    """Fit a single asset's smile and return SmileData."""
+    chain = _state["quotes"].get(ticker)
+    if chain is None:
+        raise HTTPException(status_code=404, detail=f"No quotes loaded for {ticker}")
+
+    prior = _state["priors"].get(ticker) if _state.get("priors") else None
+    observed_set = set(req.observed_tickers) if req.observed_tickers else set(_state["quotes"].keys())
+    is_observed = ticker in observed_set
+
+    smile_data = _fit_single_ticker(ticker, chain, prior, req, is_observed)
+
+    # Update solve result for this ticker if it exists
+    if _state["solve_result"] is not None and hasattr(_state["solve_result"], "nodes"):
+        solve_nodes = _state["solve_result"].nodes
+        if ticker in solve_nodes:
+            solve_nodes[ticker] = smile_data
+
+    return smile_data.dict()
 
 
 @router.post("/solve", response_model=SolveResponse)
@@ -423,6 +489,9 @@ def solve_endpoint(req: SolveRequest):
     config = _state["config"]
     config.lambda_ = req.lambda_
     config.eta = req.eta
+    config.lambda_prior = req.lambda_prior
+    config.use_bid_ask_fit = req.use_bid_ask_fit
+    config.smile_model = req.smile_model
 
     # Auto-calibrate priors if not yet done
     if not _state["priors"]:
@@ -614,8 +683,62 @@ def update_graph(update: WMatrixUpdate):
 
 # --- Phase 3: Prior Calibration ---
 
+def _calibrate_single_prior(ticker: str, chain, config, grid, phi, smile_model: str = "svi") -> dict:
+    """Calibrate a prior for a single ticker. Returns the prior dict."""
+    from ..engine.svi import fit_svi, filter_quotes_for_fit
+
+    try:
+        # Use previous close IVs if available
+        if chain.prev_close_ivs is not None and chain.prev_spot is not None:
+            prev_forward = _effective_prev_forward(ticker)
+            prior = fit_lqd_prior(
+                strikes=chain.strikes,
+                mid_ivs=chain.prev_close_ivs,
+                forward=prev_forward,
+                T=chain.T,
+                r=_get_rate(chain.T),
+                grid=grid, phi=phi,
+            )
+        else:
+            # Fallback: use current IVs
+            prior = fit_lqd_prior(
+                strikes=chain.strikes, mid_ivs=chain.mid_ivs,
+                forward=chain.forward, T=chain.T, r=_get_rate(chain.T),
+                grid=grid, phi=phi,
+            )
+    except Exception:
+        atm = chain.prev_close_atm_iv if chain.prev_close_atm_iv else chain.atm_iv
+        prior = bs_prior(atm, chain.T, grid)
+
+    # Overlay model-specific params when LQD model is selected
+    if smile_model == "lqd":
+        try:
+            from ..engine.lqd_model import fit_lqd_model
+
+            ivs = chain.prev_close_ivs if chain.prev_close_ivs is not None else chain.mid_ivs
+            fwd = _effective_prev_forward(ticker) if chain.prev_close_ivs is not None else chain.forward
+
+            # Fit LQD model
+            lqd_result = fit_lqd_model(
+                chain.strikes, ivs, fwd, chain.T,
+                atm_iv=float(ivs[np.argmin(np.abs(np.log(chain.strikes / fwd)))]),
+            )
+            prior["_lqd_theta"] = lqd_result["theta"].tolist()
+            prior["_lqd_alpha"] = lqd_result["alpha"]
+
+            # Also fit SVI for prior IV curve evaluation
+            filt_k, filt_iv, _ = filter_quotes_for_fit(chain.strikes, ivs, fwd)
+            if len(filt_k) >= 5:
+                svi_result = fit_svi(filt_k, filt_iv, fwd, chain.T)
+                prior["_svi_params"] = svi_result
+        except Exception:
+            pass  # LQD overlay failed; base prior remains valid
+
+    return prior
+
+
 @router.post("/calibrate-priors")
-def calibrate_priors():
+def calibrate_priors(smile_model: str = "svi"):
     """Fit LQD priors from previous close option prices.
 
     Uses lastPrice - change from the option chain to recover yesterday's
@@ -630,29 +753,7 @@ def calibrate_priors():
 
     priors = {}
     for ticker, chain in _state["quotes"].items():
-        try:
-            # Use previous close IVs if available
-            if chain.prev_close_ivs is not None and chain.prev_spot is not None:
-                prev_forward = _effective_prev_forward(ticker)
-                prior = fit_lqd_prior(
-                    strikes=chain.strikes,
-                    mid_ivs=chain.prev_close_ivs,
-                    forward=prev_forward,
-                    T=chain.T,
-                    r=_get_rate(chain.T),
-                    grid=grid, phi=phi,
-                )
-            else:
-                # Fallback: use current IVs
-                prior = fit_lqd_prior(
-                    strikes=chain.strikes, mid_ivs=chain.mid_ivs,
-                    forward=chain.forward, T=chain.T, r=_get_rate(chain.T),
-                    grid=grid, phi=phi,
-                )
-            priors[ticker] = prior
-        except Exception:
-            atm = chain.prev_close_atm_iv if chain.prev_close_atm_iv else chain.atm_iv
-            priors[ticker] = bs_prior(atm, chain.T, grid)
+        priors[ticker] = _calibrate_single_prior(ticker, chain, config, grid, phi, smile_model)
 
     import copy
     _state["priors_base"] = copy.deepcopy(priors)
@@ -660,10 +761,30 @@ def calibrate_priors():
     return {"status": "ok", "calibrated": list(priors.keys())}
 
 
+@router.post("/calibrate-prior/{ticker}")
+def calibrate_single_prior(ticker: str, smile_model: str = "svi"):
+    """Calibrate the prior for a single ticker."""
+    chain = _state["quotes"].get(ticker)
+    if chain is None:
+        raise HTTPException(status_code=404, detail=f"No quotes loaded for {ticker}")
+
+    config = _state["config"]
+    grid = quantile_grid(config.quantile_grid_size)
+    phi = basis_functions(grid, config.M)
+
+    import copy
+    prior = _calibrate_single_prior(ticker, chain, config, grid, phi, smile_model)
+    _state["priors"][ticker] = prior
+    _state["priors_base"][ticker] = copy.deepcopy(prior)
+
+    return {"status": "ok", "ticker": ticker}
+
+
 @router.get("/prior/{ticker}", response_model=DistributionView)
-def get_prior(ticker: str):
+def get_prior(ticker: str, smile_model: str = None):
     """Get distribution view for a prior."""
     config = _state["config"]
+    effective_model = smile_model or config.smile_model
     grid = quantile_grid(config.quantile_grid_size)
     phi = basis_functions(grid, config.M)
 
@@ -681,19 +802,23 @@ def get_prior(ticker: str):
 
     view = compute_distribution_view(prior, grid, forward, T, _get_rate(T), phi=phi, market_strikes=chain.strikes if chain else None)
 
-    # Return JW-normalized params as "beta" for the slider UI
-    jw = prior.get("_jw_params")
-    if jw:
-        beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
+    # Return model params as "beta" for the slider UI
+    lqd_theta = prior.get("_lqd_theta")
+    if lqd_theta is not None and effective_model == "lqd":
+        beta = list(lqd_theta)
     else:
-        svi = prior.get("_svi_params")
-        if svi:
-            from ..engine.svi import raw_svi_to_jw_normalized
-            chain_T = chain.T if chain else 30 / 365
-            jw = raw_svi_to_jw_normalized(svi["a"], svi["b"], svi["rho"], svi["m"], svi["sigma"], chain_T)
+        jw = prior.get("_jw_params")
+        if jw:
             beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
         else:
-            beta = [0.04, 0.0, 0.5, 0.5, 1.0]  # flat vol defaults
+            svi = prior.get("_svi_params")
+            if svi:
+                from ..engine.svi import raw_svi_to_jw_normalized
+                chain_T = chain.T if chain else 30 / 365
+                jw = raw_svi_to_jw_normalized(svi["a"], svi["b"], svi["rho"], svi["m"], svi["sigma"], chain_T)
+                beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
+            else:
+                beta = [0.04, 0.0, 0.5, 0.5, 1.0]
 
     return DistributionView(
         moneyness=view["moneyness"],
@@ -821,6 +946,39 @@ def svi_override_prior(ticker: str, req: SviOverrideRequest):
     )
 
 
+@router.post("/prior/{ticker}/lqd-override", response_model=DistributionView)
+def lqd_override_prior(ticker: str, req: dict):
+    """Override the prior LQD theta and return updated distribution view."""
+    config = _state["config"]
+    grid = quantile_grid(config.quantile_grid_size)
+    phi = basis_functions(grid, config.M)
+
+    base_prior = _state["priors_base"].get(ticker) or _state["priors"].get(ticker)
+    if base_prior is None:
+        raise HTTPException(status_code=404, detail=f"No prior for {ticker}")
+
+    chain = _state["quotes"].get(ticker)
+    forward = chain.forward if chain else 100.0
+    T = chain.T if chain else 30 / 365
+
+    theta = np.array(req.get("theta", [0.0] * 6), dtype=float)
+    alpha = base_prior.get("_lqd_alpha", chain.atm_iv * np.sqrt(max(T, 1e-8)) if chain else 0.125)
+
+    # Update the prior with new LQD params
+    updated = {**base_prior, "_lqd_theta": theta.tolist(), "_lqd_alpha": float(alpha)}
+    _state["priors"][ticker] = updated
+
+    view = compute_distribution_view(updated, grid, forward, T, _get_rate(T), phi=phi,
+                                     market_strikes=chain.strikes if chain else None)
+    return DistributionView(
+        moneyness=view["moneyness"], iv_curve=view["iv_curve"],
+        cdf_x=view["cdf_x"], cdf_y=view["cdf_y"],
+        lqd_u=view["lqd_u"], lqd_psi=view["lqd_psi"],
+        fit_forward=view.get("fit_forward"),
+        beta=theta.tolist(),
+    )
+
+
 @router.post("/smile/{ticker}/svi-override")
 def svi_override_smile(ticker: str, req: SviOverrideRequest):
     """Evaluate a smile with given JW-normalized params at display strikes."""
@@ -855,6 +1013,44 @@ def svi_override_smile(ticker: str, req: SviOverrideRequest):
         "iv_prior": [float(v) if np.isfinite(v) else None for v in iv_prior],
         "iv_marked": [float(v) if np.isfinite(v) else None for v in iv_marked],
         "beta": [req.v, req.psi_hat, req.p_hat, req.c_hat, req.vt_ratio],
+        "is_observed": True,
+    }
+
+
+@router.post("/smile/{ticker}/lqd-override")
+def lqd_override_smile(ticker: str, req: dict):
+    """Evaluate a smile with given LQD theta parameters at display strikes."""
+    chain = _state["quotes"].get(ticker)
+    if chain is None:
+        raise HTTPException(status_code=404, detail=f"No quotes for {ticker}")
+
+    from ..engine.lqd_model import lqd_iv_at_strikes
+
+    theta = np.array(req.get("theta", [0.0] * 6), dtype=float)
+    forward = chain.forward
+    T = chain.T
+    alpha = chain.atm_iv * np.sqrt(max(T, 1e-8))
+
+    iv_marked = lqd_iv_at_strikes(theta, chain.strikes, forward, T, alpha)
+    iv_marked = np.where(np.isfinite(iv_marked), iv_marked, chain.atm_iv)
+    iv_marked = np.clip(iv_marked, 0.01, 5.0)
+
+    # Prior for comparison
+    prior = _state["priors"].get(ticker)
+    svi_prior = prior.get("_svi_params") if prior else None
+    if svi_prior:
+        from ..engine.svi import svi_iv_at_strikes as svi_eval
+        iv_prior = svi_eval(svi_prior, chain.strikes, forward, T)
+        iv_prior = np.clip(iv_prior, 0.01, 5.0)
+    else:
+        iv_prior = iv_marked.copy()
+
+    return {
+        "ticker": ticker,
+        "strikes": chain.strikes.tolist(),
+        "iv_prior": [float(v) if np.isfinite(v) else None for v in iv_prior],
+        "iv_marked": [float(v) if np.isfinite(v) else None for v in iv_marked],
+        "beta": theta.tolist(),
         "is_observed": True,
     }
 
@@ -990,9 +1186,19 @@ def get_node_distribution(ticker: str):
             mkt_ivs = chain.mid_ivs if chain else nr.iv_marked
             mkt_fwd = chain.forward if chain else forward
 
-            filt_k, filt_iv, _ = filter_quotes_for_fit(mkt_strikes, mkt_ivs, mkt_fwd)
+            filt_k, filt_iv, filt_mask = filter_quotes_for_fit(mkt_strikes, mkt_ivs, mkt_fwd)
+            cfg = _state["config"]
+            filt_spread = chain.bid_ask_spread[filt_mask] if chain is not None else None
+            svi_prior_p = prior.get("_svi_params") if prior else None
+            prior_p = (np.array([svi_prior_p["a"], svi_prior_p["b"], svi_prior_p["rho"],
+                                 svi_prior_p["m"], svi_prior_p["sigma"]])
+                       if svi_prior_p and cfg.lambda_prior > 0 else None)
             if len(filt_k) >= 5:
-                market_svi = fit_svi(filt_k, filt_iv, mkt_fwd, T)
+                market_svi = fit_svi(filt_k, filt_iv, mkt_fwd, T,
+                                     bid_ask_spread=filt_spread,
+                                     use_bid_ask_fit=cfg.use_bid_ask_fit,
+                                     prior_params=prior_p,
+                                     lambda_prior=cfg.lambda_prior)
                 # Build a pseudo-prior dict with the market SVI for distribution view
                 marked_prior = {
                     **prior,
@@ -1043,10 +1249,20 @@ def get_node_distribution(ticker: str):
     # from a direct SVI fit to current market data
     if marked_dv is None and chain is not None:
         from ..engine.svi import fit_svi, filter_quotes_for_fit
-        filt_k, filt_iv, _ = filter_quotes_for_fit(chain.strikes, chain.mid_ivs, chain.forward)
+        filt_k, filt_iv, filt_mask2 = filter_quotes_for_fit(chain.strikes, chain.mid_ivs, chain.forward)
         if len(filt_k) >= 5:
             try:
-                market_svi = fit_svi(filt_k, filt_iv, chain.forward, T)
+                cfg2 = _state["config"]
+                filt_spread2 = chain.bid_ask_spread[filt_mask2]
+                svi_prior_fb = prior.get("_svi_params") if prior else None
+                prior_p2 = (np.array([svi_prior_fb["a"], svi_prior_fb["b"], svi_prior_fb["rho"],
+                                      svi_prior_fb["m"], svi_prior_fb["sigma"]])
+                            if svi_prior_fb and cfg2.lambda_prior > 0 else None)
+                market_svi = fit_svi(filt_k, filt_iv, chain.forward, T,
+                                     bid_ask_spread=filt_spread2,
+                                     use_bid_ask_fit=cfg2.use_bid_ask_fit,
+                                     prior_params=prior_p2,
+                                     lambda_prior=cfg2.lambda_prior)
                 marked_prior = {**prior, "_svi_params": market_svi}
                 marked_view = compute_distribution_view(
                     marked_prior, grid, forward, T, _get_rate(T),

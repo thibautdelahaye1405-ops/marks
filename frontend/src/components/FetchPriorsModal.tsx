@@ -70,17 +70,7 @@ export default function FetchPriorsModal({ isOpen, onClose }: Props) {
         });
       }
 
-      // Step 2: Calibrate priors for "fetch" tickers
-      const fetchSources = universe
-        .map((a) => a.ticker)
-        .filter((t) => choices[t] === "fetch");
-
-      if (fetchSources.length > 0) {
-        setProgress(`Calibrating priors from source (${fetchSources.length} assets)...`);
-        await api.calibratePriors();
-      }
-
-      // Step 3: Load saved priors for "file" tickers and restore their markers
+      // Step 2: Load saved priors for "file" tickers and restore their markers
       const fileSources = universe
         .map((a) => a.ticker)
         .filter((t) => choices[t] === "file");
@@ -111,8 +101,10 @@ export default function FetchPriorsModal({ isOpen, onClose }: Props) {
         addedPriorQuotes: { ...s.addedPriorQuotes, ...restoredAdded },
       }));
 
+      // Only mark priors as calibrated if all non-skipped assets were loaded from file
+      const hasFetchSources = universe.some((a) => choices[a.ticker] === "fetch");
       useEngine.setState((s) => ({
-        priorsCalibrated: true,
+        priorsCalibrated: !hasFetchSources,
         priorsVersion: s.priorsVersion + 1,
       }));
       setProgress("Done!");

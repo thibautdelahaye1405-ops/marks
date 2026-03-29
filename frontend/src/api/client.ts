@@ -54,7 +54,7 @@ export const api = {
   getLatestQuotes: () =>
     request<Record<string, QuoteSnapshot>>("/quotes/latest"),
 
-  fit: (req: { observed_tickers?: string[] | null; excluded_quotes?: Record<string, number[]> | null; added_quotes?: Record<string, number[][]> | null }) =>
+  fit: (req: { observed_tickers?: string[] | null; excluded_quotes?: Record<string, number[]> | null; added_quotes?: Record<string, number[][]> | null; lambda_prior?: number; use_bid_ask_fit?: boolean; smile_model?: string }) =>
     request<{ nodes: Record<string, any>; tickers: string[] }>("/fit", {
       method: "POST",
       body: JSON.stringify(req),
@@ -74,13 +74,24 @@ export const api = {
       body: JSON.stringify({ W, alphas }),
     }),
 
-  calibratePriors: () =>
-    request<{ status: string; calibrated: string[] }>("/calibrate-priors", {
+  calibratePriors: (smileModel?: string) =>
+    request<{ status: string; calibrated: string[] }>("/calibrate-priors" + (smileModel ? `?smile_model=${smileModel}` : ""), {
       method: "POST",
     }),
 
-  getPrior: (ticker: string) =>
-    request<DistributionView>(`/prior/${ticker}`),
+  calibrateSinglePrior: (ticker: string, smileModel?: string) =>
+    request<{ status: string; ticker: string }>(`/calibrate-prior/${ticker}` + (smileModel ? `?smile_model=${smileModel}` : ""), {
+      method: "POST",
+    }),
+
+  fitSingle: (ticker: string, req: { excluded_quotes?: Record<string, number[]> | null; added_quotes?: Record<string, number[][]> | null; lambda_prior?: number; use_bid_ask_fit?: boolean; smile_model?: string }) =>
+    request<any>(`/fit/${ticker}`, {
+      method: "POST",
+      body: JSON.stringify(req),
+    }),
+
+  getPrior: (ticker: string, smileModel?: string) =>
+    request<DistributionView>(`/prior/${ticker}` + (smileModel ? `?smile_model=${smileModel}` : "")),
 
   overridePrior: (ticker: string, beta: number[]) =>
     request<DistributionView>(`/prior/${ticker}/override`, {
@@ -110,6 +121,18 @@ export const api = {
     request<SmileData>(`/smile/${ticker}/svi-override`, {
       method: "POST",
       body: JSON.stringify(params),
+    }),
+
+  lqdOverrideSmile: (ticker: string, theta: number[]) =>
+    request<SmileData>(`/smile/${ticker}/lqd-override`, {
+      method: "POST",
+      body: JSON.stringify({ theta }),
+    }),
+
+  lqdOverridePrior: (ticker: string, theta: number[]) =>
+    request<DistributionView>(`/prior/${ticker}/lqd-override`, {
+      method: "POST",
+      body: JSON.stringify({ theta }),
     }),
 
   // Prior save/load

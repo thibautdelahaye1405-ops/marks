@@ -46,6 +46,9 @@ export interface SolveRequest {
   observed_tickers?: string[] | null;
   excluded_quotes?: Record<string, number[]> | null;
   added_quotes?: Record<string, number[][]> | null; // ticker -> [[strike, iv], ...]
+  lambda_prior: number;
+  use_bid_ask_fit: boolean;
+  smile_model: string;
 }
 
 export interface SolveResponse {

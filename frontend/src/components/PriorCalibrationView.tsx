@@ -3,6 +3,8 @@ import { useEngine } from "../hooks/useEngine";
 import { api } from "../api/client";
 import DistributionTripleView from "./DistributionTripleView";
 import SviSliders from "./SviSliders";
+import LqdSliders from "./LqdSliders";
+import type { LqdTraderParams } from "./LqdSliders";
 import Plot from "./Plot";
 import type { DistributionView } from "../types";
 
@@ -10,7 +12,7 @@ type ViewMode = "smile" | "distributions";
 
 export default function PriorCalibrationView() {
   const {
-    selectedNode, quotes, observedTickers, priorsVersion,
+    selectedNode, quotes, observedTickers, priorsVersion, smileModel,
     excludedPriorQuotes, togglePriorQuotePoint, resetPriorExclusions,
     addedPriorQuotes, addPriorQuotePoint, removeAddedPriorQuote, resetPriorAdditions,
   } = useEngine();
@@ -18,6 +20,8 @@ export default function PriorCalibrationView() {
   const [currentView, setCurrentView] = useState<DistributionView | null>(null);
   const [sviParams, setSviParams] = useState<{ v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number } | null>(null);
   const [baseSviParams, setBaseSviParams] = useState<{ v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number } | null>(null);
+  const [lqdParams, setLqdParams] = useState<LqdTraderParams | null>(null);
+  const [baseLqdParams, setBaseLqdParams] = useState<LqdTraderParams | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("smile");
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
 
@@ -39,25 +43,31 @@ export default function PriorCalibrationView() {
     : prevSpot;
   const effectivePrevFwd = fwdOverride ?? (currentView?.fit_forward ?? modelPrevFwd);
 
-  // Update view + SVI params (but NOT base) — used by forward slider
+  // Update view + model params (but NOT base) — used by forward slider
   const _updateViewOnly = useCallback((view: DistributionView) => {
     setCurrentView(view);
     const b = view.beta;
-    if (b && b.length >= 5) {
+    if (smileModel === "lqd" && b && b.length >= 6) {
+      setLqdParams({ min_iv: b[0], atm_skew: b[1], atm_curv: b[2], put_slope: b[3], call_slope: b[4], shoulder: b[5] });
+    } else if (b && b.length >= 5) {
       setSviParams({ v: b[0], psi_hat: b[1], p_hat: b[2], c_hat: b[3], vt_ratio: b[4] });
     }
-  }, []);
+  }, [smileModel]);
 
-  // Update view + SVI params AND base — used by exclusion/addition changes
+  // Update view + model params AND base — used by exclusion/addition changes
   const _updateViewAndBase = useCallback((view: DistributionView) => {
     setCurrentView(view);
     const b = view.beta;
-    if (b && b.length >= 5) {
+    if (smileModel === "lqd" && b && b.length >= 6) {
+      const lp: LqdTraderParams = { min_iv: b[0], atm_skew: b[1], atm_curv: b[2], put_slope: b[3], call_slope: b[4], shoulder: b[5] };
+      setLqdParams(lp);
+      setBaseLqdParams(lp);
+    } else if (b && b.length >= 5) {
       const p = { v: b[0], psi_hat: b[1], p_hat: b[2], c_hat: b[3], vt_ratio: b[4] };
       setSviParams(p);
       setBaseSviParams(p);
     }
-  }, []);
+  }, [smileModel]);
 
   const handleFwdChange = useCallback((val: number) => {
     if (!ticker) return;
@@ -93,12 +103,15 @@ export default function PriorCalibrationView() {
   // Fetch prior when ticker changes or priors are reloaded
   useEffect(() => {
     if (!ticker) return;
-    api.getPrior(ticker).then((view) => {
+    api.getPrior(ticker, smileModel).then((view) => {
       setPriorView(view);
       setCurrentView(view);
-      // Extract SVI params from beta field (a, b, rho, m, sigma)
       const b = view.beta;
-      if (b && b.length >= 5) {
+      if (smileModel === "lqd" && b && b.length >= 6) {
+        const lp: LqdTraderParams = { min_iv: b[0], atm_skew: b[1], atm_curv: b[2], put_slope: b[3], call_slope: b[4], shoulder: b[5] };
+        setLqdParams(lp);
+        setBaseLqdParams(lp);
+      } else if (b && b.length >= 5) {
         const p = { v: b[0], psi_hat: b[1], p_hat: b[2], c_hat: b[3], vt_ratio: b[4] };
         setSviParams(p);
         setBaseSviParams(p);
@@ -107,7 +120,7 @@ export default function PriorCalibrationView() {
       setPriorView(null);
       setCurrentView(null);
     });
-  }, [ticker, priorsVersion]);
+  }, [ticker, priorsVersion, smileModel]);
 
   const addedPrior = ticker ? addedPriorQuotes[ticker] ?? [] : [];
 
@@ -134,6 +147,30 @@ export default function PriorCalibrationView() {
     setSviParams(baseSviParams);
     api.sviOverridePrior(ticker, baseSviParams).then(setCurrentView).catch(() => {});
   }, [ticker, baseSviParams]);
+
+  // LQD parameter override handlers
+  const handleLqdChange = useCallback(
+    (params: LqdTraderParams) => {
+      if (!ticker) return;
+      setLqdParams(params);
+      const theta = [params.min_iv, params.atm_skew, params.atm_curv,
+                     params.put_slope, params.call_slope, params.shoulder];
+      api.lqdOverridePrior(ticker, theta).then((view) => {
+        setCurrentView(view);
+      }).catch(() => {});
+    },
+    [ticker]
+  );
+
+  const handleLqdReset = useCallback(() => {
+    if (!ticker || !baseLqdParams) return;
+    setLqdParams(baseLqdParams);
+    const theta = [baseLqdParams.min_iv, baseLqdParams.atm_skew, baseLqdParams.atm_curv,
+                   baseLqdParams.put_slope, baseLqdParams.call_slope, baseLqdParams.shoulder];
+    api.lqdOverridePrior(ticker, theta).then((view) => {
+      setCurrentView(view);
+    }).catch(() => {});
+  }, [ticker, baseLqdParams]);
 
   const handleResetExclusions = useCallback(() => {
     if (!ticker) return;
@@ -333,7 +370,7 @@ export default function PriorCalibrationView() {
                 ),
                 y: clean((currentView ?? priorView).iv_curve),
                 mode: "lines" as const,
-                name: "Fitted prior",
+                name: `Fitted prior (${smileModel.toUpperCase()})`,
                 line: { color: "#22c55e", width: 2.5 },
               },
               // Current market quotes
@@ -417,15 +454,28 @@ export default function PriorCalibrationView() {
         <DistributionTripleView
           prior={priorView}
           current={currentView}
-          priorLabel="Initial"
-          currentLabel="Calibrated"
+          priorLabel={`Initial (${smileModel.toUpperCase()})`}
+          currentLabel={`Calibrated (${smileModel.toUpperCase()})`}
           currentColor="#22c55e"
           height={165}
         />
       )}
 
-      {/* SVI parameter sliders */}
-      {sviParams && (
+      {/* Model parameter sliders */}
+      {lqdParams && smileModel === "lqd" && (
+        <div style={{ padding: "0 16px", borderTop: "1px solid #334155", marginTop: 4, paddingTop: 8 }}>
+          <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
+            LQD Parameters ({"\u03B8"})
+          </div>
+          <LqdSliders
+            values={lqdParams}
+            baseValues={baseLqdParams ?? undefined}
+            onChange={handleLqdChange}
+            onReset={handleLqdReset}
+          />
+        </div>
+      )}
+      {sviParams && smileModel === "svi" && (
         <div style={{ padding: "0 16px", borderTop: "1px solid #334155", marginTop: 4, paddingTop: 8 }}>
           <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
             SVI-JW Parameters

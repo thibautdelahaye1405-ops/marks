@@ -53,6 +53,9 @@ class SolveRequest(BaseModel):
     observed_tickers: Optional[List[str]] = None
     excluded_quotes: Optional[Dict[str, List[int]]] = None
     added_quotes: Optional[Dict[str, List[List[float]]]] = None  # ticker -> [[strike, iv], ...]
+    lambda_prior: float = 0.10         # prior-anchoring strength for SVI fit
+    use_bid_ask_fit: bool = True       # use bid-ask dead-zone loss in SVI fit
+    smile_model: str = "svi"           # smile model: "svi" or "lqd"
 
 
 class SolveResponse(BaseModel):
@@ -108,6 +111,9 @@ class FitRequest(BaseModel):
     observed_tickers: Optional[List[str]] = None
     excluded_quotes: Optional[Dict[str, List[int]]] = None
     added_quotes: Optional[Dict[str, List[List[float]]]] = None
+    lambda_prior: float = 0.10         # prior-anchoring strength for SVI fit
+    use_bid_ask_fit: bool = True       # use bid-ask dead-zone loss in SVI fit
+    smile_model: str = "svi"           # smile model: "svi" or "lqd"
 
 
 class SviOverrideRequest(BaseModel):

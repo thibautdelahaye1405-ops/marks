@@ -12,7 +12,7 @@ interface Props {
 }
 
 export default function InferredNodeView({ ticker }: Props) {
-  const { quotes, solveResult } = useEngine();
+  const { quotes, solveResult, smileModel } = useEngine();
   const [data, setData] = useState<NodeDistributionResponse | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("smile");
 
@@ -71,7 +71,7 @@ export default function InferredNodeView({ ticker }: Props) {
                     y: smileData.iv_prior
                       .map((v) => (v != null ? v * 100 : NaN)),
                     mode: "lines" as const,
-                    name: "Prior",
+                    name: `Prior (${smileModel.toUpperCase()})`,
                     line: { color: "#64748b", dash: "dash" as const, width: 2 },
                   },
                 ]
@@ -84,7 +84,7 @@ export default function InferredNodeView({ ticker }: Props) {
                     y: smileData.iv_marked
                       .map((v) => (v != null ? v * 100 : NaN)),
                     mode: "lines" as const,
-                    name: "Propagated",
+                    name: `Propagated (${smileModel.toUpperCase()})`,
                     line: { color: "#f97316", width: 2.5 },
                   },
                 ]

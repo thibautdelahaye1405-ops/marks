@@ -1,0 +1,531 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{fancyhdr}
+\setlength{\headheight}{14pt}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  citecolor=blue!50!black,
+  urlcolor=blue!50!black,
+  pdftitle={A Locally Separable 6-Parameter LQD Smile Model in Normalized Log-Returns},
+  pdfauthor={OpenAI}
+}
+
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codeframe}{RGB}{220,220,220}
+\definecolor{codekw}{RGB}{0,76,153}
+\definecolor{codecom}{RGB}{0,128,0}
+\definecolor{codestr}{RGB}{153,0,0}
+
+\lstdefinestyle{pycode}{
+  language=Python,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecom},
+  stringstyle=\color{codestr},
+  showstringspaces=false,
+  breaklines=true,
+  columns=fullflexible,
+  tabsize=4,
+  xleftmargin=0.5em,
+  xrightmargin=0.5em
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\Sig}{\Sigma}
+\newcommand{\iv}{\sigma_{\mathrm{BS}}}
+\newcommand{\vect}[1]{\bm{#1}}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{Locally separable LQD smile model}
+\rhead{\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+
+\title{A Locally Separable 6-Parameter LQD Smile Model \\ in Normalized Log-Returns}
+\author{}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\begin{abstract}
+This note develops a six-parameter \emph{log quantile density} (LQD) smile model for a normalized log-return variable
+\[
+Z = \frac{X}{\alpha}, \qquad X = \log(S_T/F_T), \qquad \alpha = \sigma_{\mathrm{ref}}\sqrt{T},
+\]
+with three design goals: (i) the tails should be consistent with Lee/SVI-type linear variance wings, (ii) the six coefficients should each have a clear qualitative effect on the smile, and (iii) after a local rotation, the parameters should be locally separable on the actual implied-volatility curve $z \mapsto \iv(\alpha z,T)$. The construction is based on a fixed logarithmic tail skeleton, a six-function Fourier basis for the bounded LQD remainder, and a two-stage local rotation: first to trader-style smile observables, then to a weighted QR orthogonalization on the full $IV(z)$ curve. A NumPy-only reference implementation is included in the appendix and as a standalone Python file.
+\end{abstract}
+
+\tableofcontents
+
+\section{Objective and notation}
+The aim is to model a normalized slice with coordinate
+\[
+z = \frac{k}{\alpha}, \qquad k = \log(K/F_T), \qquad \alpha > 0,
+\]
+so that the \emph{shape} of the smile is expressed in comparable units across underlyings and maturities. We work with the normalized terminal return variable $Z$, its quantile function
+\[
+Q(u) := F_Z^{-1}(u), \qquad u \in (0,1),
+\]
+and its quantile density and log-quantile density
+\[
+q(u) := Q'(u), \qquad \ell(u) := \log q(u).
+\]
+By construction, $q(u) > 0$ for all $u \in (0,1)$ whenever $\ell$ is finite, so the quantile map is automatically increasing. This is one of the main practical attractions of the LQD representation: positivity of the quantile density is built in through the exponential map. Quantile-density methods and their estimation theory are classical; see Jones~\cite{Jones1992}.
+
+Throughout the note, the six raw coefficients are collected in
+\[
+\theta = (p,c,m,s,\kappa,h)^\top \in \R^6,
+\]
+where the intended qualitative meanings are:
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{2.0cm}p{10.2cm}}
+\toprule
+Coefficient & Intended raw interpretation \\
+\midrule
+$p$ & Put wing: left-tail constant in the LQD, hence far-left smile wing \\
+$c$ & Call wing: right-tail constant in the LQD, hence far-right smile wing \\
+$m$ & Belly level: mainly lifts or lowers the smile around the center \\
+$s$ & Skew: first-order antisymmetric tilt around the center \\
+$\kappa$ & Kurtosis / ATM butterfly: center curvature \\
+$h$ & Shoulder: how fast the smile leaves the belly and connects to the wings \\
+\bottomrule
+\end{tabular}
+\end{center}
+Those meanings are exact only after a \emph{local} rotation described later; before rotation they are best understood as carefully designed, but still approximate, directions in LQD space.
+
+\section{Why the boundary terms must be logarithmic}
+\subsection{Lee/SVI tails imply logarithmic LQD singularities}
+The boundary choice is dictated by the tail class. If the implied total variance has linear wings in the sense of Lee's moment formula~\cite{Lee2004}, then the log-return tails are of exponential type, consistent with the familiar SVI/SSVI asymptotics; see also Gatheral and Jacquier~\cite{GatheralJacquier2014}. Write the normalized tails as
+\[
+\mathbb{P}(Z > z) \asymp e^{-\Lambda_R z} \quad (z \to +\infty),
+\qquad
+\mathbb{P}(Z < z) \asymp e^{\Lambda_L z} \quad (z \to -\infty),
+\]
+with tail rates $\Lambda_L,\Lambda_R > 0$. Then the quantile asymptotics are
+\[
+Q(u) \sim \frac{1}{\Lambda_L}\log u \quad (u \downarrow 0),
+\qquad
+Q(u) \sim -\frac{1}{\Lambda_R}\log(1-u) \quad (u \uparrow 1),
+\]
+and differentiation yields
+\[
+q(u) \sim \frac{1}{\Lambda_L u} \quad (u \downarrow 0),
+\qquad
+q(u) \sim \frac{1}{\Lambda_R (1-u)} \quad (u \uparrow 1).
+\]
+Therefore the LQD must satisfy
+\begin{equation}
+\ell(u)
+\sim -\log u - \log \Lambda_L \quad (u \downarrow 0),
+\qquad
+\ell(u)
+\sim -\log(1-u) - \log \Lambda_R \quad (u \uparrow 1).
+\label{eq:lqd-endpoints}
+\end{equation}
+The crucial consequence is that the coefficients of $-\log u$ and $-\log(1-u)$ are \emph{not} free. They must both be equal to $1$ if one wants to remain in the exponential-tail / linear-wing class. The free tail information is not in the singular coefficients, but in the \emph{endpoint constants}.
+
+\subsection{Fixed tail skeleton}
+For this reason the right starting point is
+\begin{equation}
+\ell(u) = -\log u - \log(1-u) + r(u),
+\label{eq:lqd-skeleton}
+\end{equation}
+where $r(u)$ stays bounded at both endpoints. The bounded remainder controls the left and right constants and the interior shape, while the singular part enforces the correct tail class.
+
+\section{A six-function Fourier basis for the bounded remainder}
+\subsection{Raw model}
+We write the bounded remainder as a six-term Fourier expansion,
+\begin{equation}
+r(u;\theta) = \sum_{j=1}^6 \theta_j \, \Phi_j(u),
+\qquad
+\ell(u;\theta) = -\log u - \log(1-u) + r(u;\theta),
+\label{eq:raw-lqd-model}
+\end{equation}
+with the six basis functions chosen so that two of them control the endpoint constants and the other four isolate the first few center jets.
+
+\subsection{Wing modes}
+Define
+\begin{align}
+\Phi_P(u)
+&= \frac{3}{16} + \frac{3}{8}\cos(\pi u) + \frac{1}{4}\cos(2\pi u)
+   + \frac{1}{8}\cos(3\pi u) + \frac{1}{16}\cos(4\pi u),
+\label{eq:PhiP}\\
+\Phi_C(u)
+&= \Phi_P(1-u)
+ = \frac{3}{16} - \frac{3}{8}\cos(\pi u) + \frac{1}{4}\cos(2\pi u)
+   - \frac{1}{8}\cos(3\pi u) + \frac{1}{16}\cos(4\pi u).
+\label{eq:PhiC}
+\end{align}
+These satisfy
+\[
+\Phi_P(0)=1,\ \Phi_P(1)=0,
+\qquad
+\Phi_C(0)=0,\ \Phi_C(1)=1,
+\]
+while around the center $u = \tfrac12 + t$ they start only at cubic order,
+\[
+\Phi_P\Bigl(\tfrac12+t\Bigr) = -\frac{\pi^3}{2}t^3 + O(t^4),
+\qquad
+\Phi_C\Bigl(\tfrac12+t\Bigr) = +\frac{\pi^3}{2}t^3 + O(t^4).
+\]
+So they mainly change the endpoint constants and hence the far wings, while leaving the ATM level, ATM slope, and ATM curvature almost untouched at leading order.
+
+With coefficients $(p,c)$ in front of $(\Phi_P,\Phi_C)$, the endpoint expansions become
+\[
+\ell(u) = -\log u + p + O(u) \quad (u \downarrow 0),
+\qquad
+\ell(u) = -\log(1-u) + c + O(1-u) \quad (u \uparrow 1),
+\]
+so the normalized tail rates are
+\begin{equation}
+\Lambda_L = e^{-p},
+\qquad
+\Lambda_R = e^{-c}.
+\label{eq:tail-rates}
+\end{equation}
+This is the exact sense in which $p$ and $c$ are the put-wing and call-wing parameters.
+
+\subsection{Belly modes}
+For the interior modes we use sine combinations that vanish at both endpoints and isolate the first few center jets:
+\begin{align}
+\Phi_0(u)
+&= \frac{75}{64}\sin(\pi u) + \frac{25}{128}\sin(3\pi u) + \frac{3}{128}\sin(5\pi u), \\
+\Phi_1(u)
+&= -\frac{8\sin(2\pi u) + \sin(4\pi u)}{12\pi}, \\
+\Phi_2(u)
+&= \frac{34\sin(\pi u) + 39\sin(3\pi u) + 5\sin(5\pi u)}{96\pi^2}, \\
+\Phi_4(u)
+&= \frac{2\sin(\pi u) + 3\sin(3\pi u) + \sin(5\pi u)}{16\pi^4}.
+\end{align}
+Near the center $u = \tfrac12 + t$ they satisfy
+\begin{equation}
+\Phi_0 = 1 + O(t^6),
+\qquad
+\Phi_1 = t + O(t^5),
+\qquad
+\Phi_2 = t^2 + O(t^6),
+\qquad
+\Phi_4 = t^4 + O(t^6).
+\label{eq:center-jets}
+\end{equation}
+This is the key rationale for the choice: the four interior coefficients align, as much as possible in a low-dimensional model, with level, skew, curvature, and shoulder-width directions.
+
+\subsection{Summary table}
+Collecting all six modes,
+\[
+\Phi(u) = \bigl(\Phi_P(u),\Phi_C(u),\Phi_0(u),\Phi_1(u),\Phi_2(u),\Phi_4(u)\bigr),
+\qquad
+\theta = (p,c,m,s,\kappa,h)^\top,
+\]
+so that
+\[
+\ell(u;\theta) = -\log u - \log(1-u) + \Phi(u)\theta.
+\]
+The qualitative role of each mode is summarized in Table~\ref{tab:raw-basis-summary}.
+
+\begin{table}[h]
+\centering
+\caption{Raw six-function LQD basis and its intended role.}
+\label{tab:raw-basis-summary}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{2.1cm} >{\raggedright\arraybackslash}p{4.6cm} X}
+\toprule
+Mode & Main effect & Why it is separated \\
+\midrule
+$\Phi_P$ & Put wing / left tail constant & $\Phi_P(0)=1$, $\Phi_P(1)=0$, and its center jet starts only at cubic order \\
+$\Phi_C$ & Call wing / right tail constant & $\Phi_C(1)=1$, $\Phi_C(0)=0$, and its center jet starts only at cubic order \\
+$\Phi_0$ & Belly level & Equal to $1+O(t^6)$ at the center and zero at both endpoints \\
+$\Phi_1$ & Skew & First-order antisymmetric center jet, zero at both endpoints \\
+$\Phi_2$ & ATM curvature / butterfly & Second-order symmetric center jet, zero at both endpoints \\
+$\Phi_4$ & Shoulder / wing-connection & Fourth-order symmetric center jet, zero at both endpoints \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Stable numerical construction in logistic coordinates}
+A practical advantage of the fixed tail skeleton~\eqref{eq:lqd-skeleton} is that it disappears exactly under the logistic change of variables
+\[
+x = \log\frac{u}{1-u},
+\qquad
+u(x) = \frac{1}{1+e^{-x}},
+\qquad
+\frac{\dd u}{\dd x} = u(1-u).
+\]
+Since
+\[
+q(u) = e^{\ell(u)} = \frac{e^{r(u)}}{u(1-u)},
+\]
+we obtain the remarkably simple identity
+\begin{equation}
+\frac{\dd Q}{\dd x}
+= q(u(x))\frac{\dd u}{\dd x}
+= e^{r(u(x))}.
+\label{eq:dQdx}
+\end{equation}
+Thus the endpoint singularities are regularized \emph{exactly}. Numerically, this is the right coordinate in which to integrate the quantile. Once $Q$ is constructed, it is convenient to center it by imposing
+\[
+Q\Bigl(\tfrac12\Bigr)=0,
+\]
+which corresponds to setting the median of $Z$ to zero. Any remaining location shift is then handled later through the risk-neutral martingale constraint.
+
+\subsection{Risk-neutral embedding and smile extraction}
+Let
+\[
+X = \mu + \alpha Z,
+\]
+where the positive scale $\alpha$ is the normalization used on the strike axis, typically a reference ATM total standard deviation. The martingale condition $\E[e^X]=1$ determines
+\begin{equation}
+\mu(\theta)
+= -\log \E\left[e^{\alpha Z}\right]
+= -\log\int_0^1 e^{\alpha Q(u;\theta)}\,\dd u.
+\label{eq:martingale-shift}
+\end{equation}
+Then the forward call price at log-moneyness $k$ is
+\begin{equation}
+C(k;\theta)
+= \int_0^1 \Bigl(e^{\mu(\theta)+\alpha Q(u;\theta)} - e^k\Bigr)^+\,\dd u.
+\label{eq:call-price}
+\end{equation}
+Finally, the actual smile on the normalized abscissa is
+\begin{equation}
+\Sig(z;\theta) := \iv(\alpha z, T; \theta),
+\label{eq:smile-map}
+\end{equation}
+namely the Black-Scholes implied volatility extracted from the price at $k = \alpha z$ and maturity $T$.
+
+\section{Why a local rotation is needed}
+The raw parameters $(p,c,m,s,\kappa,h)$ are well designed, but the map
+\[
+\theta \longmapsto \Sig(\cdot;\theta)
+\]
+is nonlinear and couples the raw directions. In other words, a unit increase in $m$ does not move only the belly level once prices are translated into implied volatilities; similarly, a pure raw skew move slightly perturbs the wings and the minimum. Therefore, if the objective is \emph{local separability on the actual IV curve}, one should rotate the raw coefficients around a reference slice.
+
+There are two good reasons to perform the rotation in two stages rather than one:
+\begin{enumerate}[leftmargin=2.2em]
+\item first align the raw coefficients with \emph{interpretable smile observables};
+\item then orthogonalize those observable directions on the full curve with a weighted QR.
+\end{enumerate}
+A direct QR of the raw basis would produce orthogonal directions, but it would discard the trader intuition attached to the six parameters.
+
+\section{Stage 1: local trader coordinates}
+Fix a reference slice $\theta_*$ and a normalized strike grid
+\[
+z_1,\dots,z_N.
+\]
+Define the smile vector
+\[
+\sigma(\theta)
+:= \bigl(\Sig(z_1;\theta),\dots,\Sig(z_N;\theta)\bigr)^\top \in \R^N.
+\]
+Its Jacobian at the reference point is
+\begin{equation}
+J := \frac{\partial \sigma}{\partial \theta}(\theta_*) \in \R^{N\times 6}.
+\label{eq:J-def}
+\end{equation}
+
+\subsection{Six local smile observables}
+We now choose six linearized smile observables that match the intended meaning of the parameters:
+\begin{align}
+y_1 &= \Sig(z_{\min}^*), \\
+y_2 &= \Sig_z(0), \\
+y_3 &= \Sig_{zz}(0), \\
+y_4 &= S_P := \frac{\Sig(-z_2)-\Sig(-z_1)}{z_1-z_2}, \\
+y_5 &= S_C := \frac{\Sig(z_2)-\Sig(z_1)}{z_2-z_1}, \\
+y_6 &= Sh := \frac{\Sig(z_s)+\Sig(-z_s)}{2} - \Sig(0) - \frac{z_s^2}{2}\Sig_{zz}(0).
+\label{eq:observable-defs}
+\end{align}
+Here $z_{\min}^*$ is the minimum location of the \emph{reference} smile, frozen once the linearization point is chosen. This freezing is important: if the minimum location were re-optimized under perturbations, the observable would become nonlinear and would re-entangle skew and curvature.
+
+The interpretation of the six observables is:
+\[
+(y_1,y_2,y_3,y_4,y_5,y_6)
+=
+(\text{min-level},\ \text{ATM skew},\ \text{ATM curvature},\ \text{put wing},\ \text{call wing},\ \text{shoulder}).
+\]
+The shoulder observable subtracts the quadratic center contribution so that it reacts mainly to the belly-to-wing transition rather than to plain ATM curvature.
+
+In numerical work we realize these observables as linear combinations of smile values on the grid $z_1,\dots,z_N$. Hence there exists an operator
+\[
+O \in \R^{6\times N}
+\]
+such that
+\[
+y(\theta) = O\,\sigma(\theta),
+\]
+at least after freezing $z_{\min}^*$ and choosing the finite-difference stencils.
+Then
+\begin{equation}
+K := \frac{\partial y}{\partial \theta}(\theta_*) = OJ \in \R^{6\times 6}.
+\label{eq:K-def}
+\end{equation}
+The \emph{trader coordinates} are now defined by
+\begin{equation}
+c := K(\theta-\theta_*).
+\label{eq:trader-coords}
+\end{equation}
+By construction,
+\begin{equation}
+\delta y = \delta c + O(\|\delta\theta\|^2).
+\label{eq:delta-y-delta-c}
+\end{equation}
+So, to first order, $c_1$ is a pure minimum-level move, $c_2$ a pure ATM skew move, and so on.
+
+\paragraph{Remark.}
+Because the construction is on the actual IV curve, $y_1$ is a \emph{minimum-IV} observable. If one wants a closer analogue of the SVI-JW minimum-variance parameter, replace $y_1$ by the minimum of total variance or total standard deviation; the methodology is unchanged.
+
+\section{Stage 2: weighted QR orthogonalization on the smile curve}
+The trader coordinates are interpretable but not orthogonal on the whole curve. To obtain a numerically convenient basis for optimization and regularization, choose a diagonal positive weight matrix
+\[
+W = \operatorname{diag}(w_1,\dots,w_N),
+\qquad w_i > 0,
+\]
+for example vega weights, bid-ask inverse-variance weights, or a center-heavy proxy. Consider
+\begin{equation}
+A := W^{1/2} J K^{-1} \in \R^{N\times 6}.
+\label{eq:A-def}
+\end{equation}
+Perform a reduced QR decomposition,
+\begin{equation}
+A = QR,
+\qquad Q^\top Q = I_6,
+\qquad R \text{ upper triangular}.
+\label{eq:qr-decomp}
+\end{equation}
+Then define the \emph{orthogonal curve coordinates}
+\begin{equation}
+b := Rc = RK(\theta-\theta_*).
+\label{eq:b-def}
+\end{equation}
+Substituting~\eqref{eq:b-def} into the linearized smile map yields
+\begin{equation}
+\delta\sigma
+\approx J\,\delta\theta
+= W^{-1/2}Q\,\delta b.
+\label{eq:orthogonal-smile-moves}
+\end{equation}
+So the six columns of $Q$ are orthonormal local smile moves in the weighted IV metric. This is the exact sense in which the $b$-coordinates are \emph{locally separable on the actual $IV(z)$ curve}.
+
+\subsection{Three coordinate systems}
+The construction produces three useful coordinate systems:
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{2.3cm} >{\raggedright\arraybackslash}p{3.2cm} p{7.0cm}}
+\toprule
+System & Symbol & Role \\
+\midrule
+Raw LQD coefficients & $\theta$ & Natural parametric basis in quantile-density space \\
+Trader coordinates & $c = K(\theta-\theta_*)$ & Locally equal to the chosen six IV observables \\
+Orthogonal curve coordinates & $b = Rc$ & Locally orthogonal on the weighted smile curve \\
+\bottomrule
+\end{tabular}
+\end{center}
+In practice, the clean workflow is: \emph{report} $c$, \emph{optimize} in $b$, and keep $\theta$ only as the internal representation.
+
+\section{Rotated LQD basis functions}
+Since
+\[
+\theta-\theta_* = K^{-1}c = K^{-1}R^{-1}b,
+\]
+the LQD can be rewritten as
+\begin{equation}
+\ell(u;b)
+= \ell(u;\theta_*) + \sum_{j=1}^6 b_j\,\Psi_j(u),
+\label{eq:rotated-lqd}
+\end{equation}
+where the rotated basis functions are
+\begin{equation}
+\Psi_j(u) = \sum_{i=1}^6 \Phi_i(u)\,\bigl(K^{-1}R^{-1}\bigr)_{ij}.
+\label{eq:rotated-basis}
+\end{equation}
+These $\Psi_j$ are still basis functions in LQD space, but they are now aligned with locally orthogonal smile moves. In other words, the raw Fourier basis gives the right \emph{functional scaffold}, while the local QR gives the right \emph{market geometry}.
+
+\section{Recommended practical choices}
+A robust default setup is:
+\begin{itemize}[leftmargin=1.8em]
+\item normalized strike grid $z \in [-3,3]$ with roughly $40$ to $60$ points;
+\item center finite-difference step $\delta = 0.25$;
+\item wing intervals $[z_1,z_2] = [1.5,2.5]$;
+\item shoulder point $z_s = 1.0$;
+\item weights proportional to option vega divided by squared bid-ask spread, if market data are available.
+\end{itemize}
+If one only wants a model-space orthogonalization, a smooth center-heavy choice such as $w_i = 1/(1+z_i^2)$ works well.
+
+\section{Calibration workflow}
+The recommended calibration loop for a single slice is:
+\begin{enumerate}[leftmargin=1.9em]
+\item Fit the raw six-parameter LQD model $\theta$ to the slice.
+\item Freeze the resulting fit as $\theta_*$ and build $J$, $O$, $K$, and the QR factors.
+\item Re-express perturbations in orthogonal coordinates $b$ for optimization or temporal smoothing.
+\item Report the slice in trader coordinates $c$, which have the clearest interpretation.
+\item Refresh the local rotation whenever the reference slice moves materially; the entire construction is local by design.
+\end{enumerate}
+
+\section{Why this construction is useful}
+The methodology solves three problems at once:
+\begin{enumerate}[leftmargin=1.9em]
+\item \textbf{Tail correctness.} The fixed $-\log u$ and $-\log(1-u)$ singularities enforce the exponential tail class associated with Lee/SVI-type linear wings.
+\item \textbf{Interpretability.} The six raw Fourier modes are already designed to act like put wing, call wing, belly level, skew, curvature, and shoulder.
+\item \textbf{Local separability on the actual smile.} The two-stage local rotation makes the parameters act independently on the actual implied-volatility curve rather than merely on the LQD.
+\end{enumerate}
+In that sense, the model plays the same role for LQD-based smiles that SVI-JW plays for raw SVI: the representation separates level from shape as much as possible, and then the local coordinates are chosen to match directly interpretable smile moves.
+
+\appendix
+\section{NumPy reference implementation}
+The accompanying Python file implements the full methodology:
+\begin{itemize}[leftmargin=1.8em]
+\item the six raw LQD basis functions,
+\item stable quantile construction in logistic coordinates,
+\item risk-neutral martingale centering,
+\item option pricing and Black-Scholes inversion,
+\item the observable operator $O$,
+\item the Jacobian matrices $J$ and $K$,
+\item the weighted QR rotation,
+\item the rotated LQD basis functions.
+\end{itemize}
+For convenience the complete source is included below.
+
+\lstset{style=pycode}
+\lstinputlisting{lqd_local_qr.py}
+
+\begin{thebibliography}{9}
+
+\bibitem{Jones1992}
+M. C. Jones,
+\emph{Estimating densities, quantiles, quantile densities and density quantiles},
+Annals of the Institute of Statistical Mathematics, 44(4):721--727, 1992.
+
+\bibitem{Lee2004}
+Roger W. Lee,
+\emph{The moment formula for implied volatility at extreme strikes},
+Mathematical Finance, 14(3):469--480, 2004.
+
+\bibitem{GatheralJacquier2014}
+Jim Gatheral and Antoine Jacquier,
+\emph{Arbitrage-free SVI volatility surfaces},
+Quantitative Finance, 14(1):59--71, 2014.
+
+\end{thebibliography}
+
+\end{document}

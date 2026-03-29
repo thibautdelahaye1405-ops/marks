@@ -16,27 +16,52 @@ export default function ControlPanel({
     error,
     quotes,
     priorsCalibrated,
-    solveResult,
     fetchSnapshot,
+    calibrateAllPriors,
+    fitAllSnapshots,
   } = useEngine();
 
   const hasQuotes = Object.keys(quotes).length > 0;
 
   return (
     <div style={barStyle}>
-      {/* Buttons */}
+      {/* Fetch buttons */}
       <button onClick={onFetchPriors} disabled={loading} style={btnStyle}>
         {loading ? "..." : "Fetch Priors"}
       </button>
       <button
         onClick={fetchSnapshot}
-        disabled={loading || !priorsCalibrated}
+        disabled={loading || !hasQuotes}
         style={{
           ...btnStyle,
-          background: priorsCalibrated ? "#0ea5e9" : "#475569",
+          background: hasQuotes ? "#0ea5e9" : "#475569",
         }}
       >
         Fetch Snapshot
+      </button>
+
+      <div style={divider} />
+
+      {/* Calibrate / Fit buttons */}
+      <button
+        onClick={calibrateAllPriors}
+        disabled={loading || !hasQuotes}
+        style={{
+          ...btnStyle,
+          background: hasQuotes ? "#22c55e" : "#475569",
+        }}
+      >
+        Calibrate Priors
+      </button>
+      <button
+        onClick={fitAllSnapshots}
+        disabled={loading || !hasQuotes || !priorsCalibrated}
+        style={{
+          ...btnStyle,
+          background: hasQuotes && priorsCalibrated ? "#0ea5e9" : "#475569",
+        }}
+      >
+        Fit Snapshot
       </button>
 
       <div style={divider} />
@@ -48,15 +73,8 @@ export default function ControlPanel({
         Referential
       </button>
 
-      {/* Status */}
-      <div style={{ fontSize: 11, color: "#64748b", marginLeft: "auto", whiteSpace: "nowrap" }}>
-        {hasQuotes ? `${Object.keys(quotes).length} assets` : ""}
-        {priorsCalibrated ? " | priors ok" : ""}
-        {solveResult ? ` | ${solveResult.tickers.length} propagated` : ""}
-      </div>
-
       {error && (
-        <div style={{ color: "#f87171", fontSize: 11, whiteSpace: "nowrap" }}>
+        <div style={{ color: "#f87171", fontSize: 11, whiteSpace: "nowrap", marginLeft: "auto" }}>
           {error.slice(0, 60)}
         </div>
       )}

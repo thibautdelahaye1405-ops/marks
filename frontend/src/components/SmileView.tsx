@@ -1,6 +1,8 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import Plot from "./Plot";
 import SviSliders from "./SviSliders";
+import LqdSliders from "./LqdSliders";
+import type { LqdTraderParams } from "./LqdSliders";
 import { api } from "../api/client";
 import type { SmileData, QuoteSnapshot } from "../types";
 import { useEngine } from "../hooks/useEngine";
@@ -15,6 +17,7 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
   const {
     excludedQuotes, toggleQuotePoint, resetExclusions,
     addedQuotes, addQuotePoint, removeAddedQuote, resetAdditions,
+    smileModel,
   } = useEngine();
 
   const added = addedQuotes[ticker] ?? [];
@@ -60,18 +63,29 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
   const [baseSviParams, setBaseSviParams] = useState<{ v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number } | null>(null);
   const [overriddenSmile, setOverriddenSmile] = useState<SmileData | null>(null);
 
-  // Extract SVI params from solve result
+  // LQD parameter state
+  const [lqdParams, setLqdParams] = useState<LqdTraderParams | null>(null);
+  const [baseLqdParams, setBaseLqdParams] = useState<LqdTraderParams | null>(null);
+
+  // Extract model params from solve result
   useEffect(() => {
-    if (smileData?.beta && smileData.beta.length >= 5 && smileData.is_observed) {
+    if (!smileData?.beta || !smileData.is_observed) return;
+    setOverriddenSmile(null);
+
+    if (smileModel === "lqd" && smileData.beta.length >= 6) {
+      const lp: LqdTraderParams = {
+        min_iv: smileData.beta[0], atm_skew: smileData.beta[1],
+        atm_curv: smileData.beta[2], put_slope: smileData.beta[3],
+        call_slope: smileData.beta[4], shoulder: smileData.beta[5],
+      };
+      setLqdParams(lp);
+      if (fwdOverride == null) setBaseLqdParams(lp);
+    } else if (smileData.beta.length >= 5) {
       const p = { v: smileData.beta[0], psi_hat: smileData.beta[1], p_hat: smileData.beta[2], c_hat: smileData.beta[3], vt_ratio: smileData.beta[4] };
       setSviParams(p);
-      // Only update base when forward is NOT overridden — so slider shows delta
-      if (fwdOverride == null) {
-        setBaseSviParams(p);
-      }
-      setOverriddenSmile(null);
+      if (fwdOverride == null) setBaseSviParams(p);
     }
-  }, [smileData, fwdOverride]);
+  }, [smileData, fwdOverride, smileModel]);
 
   const handleSviChange = useCallback(
     (params: { v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number }) => {
@@ -89,6 +103,26 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
     setSviParams(baseSviParams);
     setOverriddenSmile(null);
   }, [baseSviParams]);
+
+  // LQD slider override handler
+  const handleLqdChange = useCallback(
+    (params: LqdTraderParams) => {
+      if (!ticker) return;
+      setLqdParams(params);
+      const theta = [params.min_iv, params.atm_skew, params.atm_curv,
+                     params.put_slope, params.call_slope, params.shoulder];
+      api.lqdOverrideSmile(ticker, theta).then((result) => {
+        setOverriddenSmile(result);
+      }).catch(() => {});
+    },
+    [ticker]
+  );
+
+  const handleLqdReset = useCallback(() => {
+    if (!baseLqdParams) return;
+    setLqdParams(baseLqdParams);
+    setOverriddenSmile(null);
+  }, [baseLqdParams]);
 
   // Use overridden smile data if available
   const displaySmile = overriddenSmile ?? smileData;
@@ -189,11 +223,12 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
 
   // Prior + marked curves
   if (displaySmile) {
+    const modelTag = smileModel.toUpperCase();
     traces.push({
       x: displaySmile.strikes,
       y: displaySmile.iv_prior.map((v) => (v != null ? v * 100 : null)) as number[],
       mode: "lines",
-      name: "Prior",
+      name: `Prior (${modelTag})`,
       line: { color: "#64748b", dash: "dash", width: 2 },
     });
 
@@ -201,7 +236,7 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
       x: displaySmile.strikes,
       y: displaySmile.iv_marked.map((v) => (v != null ? v * 100 : null)) as number[],
       mode: "lines",
-      name: "Marked",
+      name: `Marked (${modelTag})`,
       line: { color: displaySmile.is_observed ? "#3b82f6" : "#f97316", width: 3 },
     });
   }
@@ -301,8 +336,21 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
           })()}
         </div>
       )}
-      {/* SVI parameter sliders for observed nodes */}
-      {sviParams && displaySmile?.is_observed && (
+      {/* Smile parameter sliders for observed nodes */}
+      {lqdParams && displaySmile?.is_observed && smileModel === "lqd" && (
+        <div style={{ padding: "0 16px", borderTop: "1px solid #334155", marginTop: 4, paddingTop: 8 }}>
+          <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
+            LQD Parameters ({"\u03B8"})
+          </div>
+          <LqdSliders
+            values={lqdParams}
+            baseValues={baseLqdParams ?? undefined}
+            onChange={handleLqdChange}
+            onReset={handleLqdReset}
+          />
+        </div>
+      )}
+      {sviParams && displaySmile?.is_observed && smileModel === "svi" && (
         <div style={{ padding: "0 16px", borderTop: "1px solid #334155", marginTop: 4, paddingTop: 8 }}>
           <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
             SVI-JW Parameters

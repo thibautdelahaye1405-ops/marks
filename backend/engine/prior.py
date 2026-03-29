@@ -354,14 +354,33 @@ def compute_distribution_view(
     moneyness = np.linspace(m_lo, m_hi, n_moneyness)
     strikes = forward * np.exp(moneyness)
 
+    lqd_theta = prior_dict.get("_lqd_theta")
+    lqd_alpha = prior_dict.get("_lqd_alpha")
     svi_params = prior_dict.get("_svi_params")
 
-    if svi_params is not None:
+    if lqd_theta is not None and lqd_alpha is not None:
+        # LQD model: derive IV, CDF, LQD natively from the quantile
+        from .lqd import (evaluate_lqd, reconstruct_quantile,
+                          basis_functions as lqd_basis, quantile_grid as lqd_grid,
+                          lqd_implied_vols)
+        theta = np.asarray(lqd_theta, dtype=float)
+        alpha = float(lqd_alpha)
+        u = lqd_grid(len(grid))
+        phi_lqd = lqd_basis(u)
+        iv_curve = lqd_implied_vols(theta, alpha, u, strikes, forward, T, r=r, phi=phi_lqd)
+        iv_curve = np.where(np.isfinite(iv_curve), iv_curve, 0.25)
+        iv_curve = np.clip(iv_curve, 0.01, 5.0)
+        # CDF: Q(u) gives the quantile, so CDF_x = Q(u), CDF_y = u
+        ell = evaluate_lqd(theta, u, phi_lqd)
+        Q_lqd = reconstruct_quantile(ell, u, theta=theta, phi=phi_lqd)
+        cdf_x = (alpha * Q_lqd).tolist()  # un-normalise to log-return scale
+        cdf_y = u.tolist()
+        lqd_psi = ell
+    elif svi_params is not None:
         # IV from SVI
         from .svi import svi_iv_at_strikes
         iv_curve = svi_iv_at_strikes(svi_params, strikes, forward, T)
         iv_curve = np.clip(iv_curve, 0.01, 5.0)
-
         # CDF and LQD from SVI via Breeden-Litzenberger
         svi_dist = _svi_to_cdf_lqd(svi_params, forward, T, r, grid)
         cdf_x = svi_dist["cdf_x"]
@@ -373,11 +392,9 @@ def compute_distribution_view(
             quantile_to_call_prices(Q, grid, forward, T, r, strikes),
             forward, strikes, T, r,
         )
-        # CDF from BS quantile: centre on median, scale by σ√T
         Q_median = float(np.interp(0.5, grid, Q))
         cdf_x = ((Q - Q_median) / max(s, 1e-10)).tolist()
         cdf_y = grid.tolist()
-        # LQD of standardised shape: ψ̃(u) = log(Q'(u)) - log(σ√T)
         lqd_psi = psi - np.log(max(s, 1e-10))
 
     return {
@@ -387,7 +404,7 @@ def compute_distribution_view(
         "cdf_y": cdf_y if isinstance(cdf_y, list) else cdf_y.tolist(),
         "lqd_u": grid.tolist(),
         "lqd_psi": [float(v) if np.isfinite(v) else None for v in lqd_psi],
-        "fit_forward": float(svi_params["forward"]) if svi_params else float(forward),
+        "fit_forward": float(svi_params["forward"]) if svi_params and "forward" in svi_params else float(forward),
     }
 
 

@@ -25,6 +25,8 @@ interface EngineState {
   // Hyperparameters
   lambda: number;
   eta: number;
+  lambdaPrior: number;
+  useBidAskFit: boolean;
   shockNudges: Record<string, number>;
   alphaOverrides: Record<string, number>;
 
@@ -34,6 +36,10 @@ interface EngineState {
   excludedPriorQuotes: Record<string, number[]>;
   addedQuotes: Record<string, [number, number][]>;      // ticker -> [[strike, iv], ...]
   addedPriorQuotes: Record<string, [number, number][]>; // ticker -> [[strike, iv], ...]
+
+  // Smile model
+  smileModel: string;  // "svi" | "lqd"
+  setSmileModel: (model: string) => void;
 
   // Prior state
   priorsCalibrated: boolean;
@@ -56,6 +62,8 @@ interface EngineState {
   setSelectedNode: (ticker: string | null) => void;
   setLambda: (v: number) => void;
   setEta: (v: number) => void;
+  setLambdaPrior: (v: number) => void;
+  setUseBidAskFit: (v: boolean) => void;
   setShockNudge: (ticker: string, nudge: number) => void;
   setAlphaOverride: (ticker: string, alpha: number) => void;
   updateW: (W: number[][]) => Promise<void>;
@@ -65,6 +73,10 @@ interface EngineState {
   addQuotePoint: (ticker: string, strike: number, iv: number) => void;
   removeAddedQuote: (ticker: string, index: number) => void;
   resetAdditions: (ticker: string) => void;
+  calibrateAllPriors: () => Promise<void>;
+  fitAllSnapshots: () => Promise<void>;
+  fitSingleAsset: (ticker: string) => Promise<void>;
+  calibrateSinglePrior: (ticker: string) => Promise<void>;
   togglePriorQuotePoint: (ticker: string, index: number) => void;
   resetPriorExclusions: (ticker: string) => void;
   addPriorQuotePoint: (ticker: string, strike: number, iv: number) => void;
@@ -73,6 +85,16 @@ interface EngineState {
 }
 
 let _propagateSeq = 0;
+
+/** Recalculate the currently selected node (prior + snapshot if observed). */
+function _recalcSelected(get: () => EngineState) {
+  const { selectedNode, quotes, observedTickers } = get();
+  if (!selectedNode || Object.keys(quotes).length === 0) return;
+  get().calibrateSinglePrior(selectedNode);
+  if (observedTickers.includes(selectedNode)) {
+    get().fitSingleAsset(selectedNode);
+  }
+}
 
 export const useEngine = create<EngineState>((set, get) => ({
   catalog: [],
@@ -86,6 +108,8 @@ export const useEngine = create<EngineState>((set, get) => ({
   error: null,
   lambda: 1.0,
   eta: 0.01,
+  lambdaPrior: 0.10,
+  useBidAskFit: true,
   shockNudges: {},
   alphaOverrides: {},
   observedTickers: [],
@@ -93,6 +117,7 @@ export const useEngine = create<EngineState>((set, get) => ({
   excludedPriorQuotes: {},
   addedQuotes: {},
   addedPriorQuotes: {},
+  smileModel: "svi",
   priorsCalibrated: false,
   priorsVersion: 0,
   universeUnsaved: false,
@@ -183,9 +208,8 @@ export const useEngine = create<EngineState>((set, get) => ({
         excludedQuotes: {},
         excludedPriorQuotes: {},
         solveResult: null,
+        loading: false,
       });
-      await api.calibratePriors();
-      set({ priorsCalibrated: true, loading: false });
     } catch (e: any) {
       set({ error: e.message, loading: false });
     }
@@ -206,15 +230,13 @@ export const useEngine = create<EngineState>((set, get) => ({
         observedTickers: kept,
         loading: false,
       });
-      // Auto-fit (no propagation) with fresh quotes
-      await get().fit();
     } catch (e: any) {
       set({ error: e.message, loading: false });
     }
   },
 
   fit: async () => {
-    const { observedTickers, excludedQuotes, addedQuotes } = get();
+    const { observedTickers, excludedQuotes, addedQuotes, lambdaPrior, useBidAskFit, smileModel } = get();
     const seq = ++_propagateSeq;
     set({ loading: true, error: null });
     try {
@@ -224,6 +246,9 @@ export const useEngine = create<EngineState>((set, get) => ({
         observed_tickers: observedTickers.length > 0 ? observedTickers : null,
         excluded_quotes: excl,
         added_quotes: added,
+        lambda_prior: lambdaPrior,
+        use_bid_ask_fit: useBidAskFit,
+        smile_model: smileModel,
       });
       if (seq === _propagateSeq) {
         // Build a minimal solveResult-like object for display
@@ -248,9 +273,66 @@ export const useEngine = create<EngineState>((set, get) => ({
     }
   },
 
+  calibrateAllPriors: async () => {
+    const { smileModel } = get();
+    set({ loading: true, error: null });
+    try {
+      await api.calibratePriors(smileModel);
+      set({ priorsCalibrated: true, loading: false });
+    } catch (e: any) {
+      set({ error: e.message, loading: false });
+    }
+  },
+
+  fitAllSnapshots: async () => {
+    set({ loading: true, error: null });
+    try {
+      await get().fit();
+      set({ loading: false });
+    } catch (e: any) {
+      set({ error: e.message, loading: false });
+    }
+  },
+
+  fitSingleAsset: async (ticker: string) => {
+    const { excludedQuotes, addedQuotes, lambdaPrior, useBidAskFit, smileModel } = get();
+    try {
+      const excl = excludedQuotes[ticker] ? { [ticker]: excludedQuotes[ticker] } : null;
+      const added = addedQuotes[ticker] ? { [ticker]: addedQuotes[ticker] } : null;
+      const result = await api.fitSingle(ticker, {
+        excluded_quotes: excl,
+        added_quotes: added,
+        lambda_prior: lambdaPrior,
+        use_bid_ask_fit: useBidAskFit,
+        smile_model: smileModel,
+      });
+      // Update just this ticker in solveResult
+      set((s) => {
+        const nodes = { ...(s.solveResult?.nodes ?? {}), [ticker]: result };
+        return {
+          solveResult: {
+            ...(s.solveResult ?? { W: [], alphas: [], tickers: Object.keys(nodes), propagation_matrix: null, neumann_terms: null, influence_scores: null, wasserstein_distances: null }),
+            nodes,
+          },
+        };
+      });
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
+
+  calibrateSinglePrior: async (ticker: string) => {
+    const { smileModel } = get();
+    try {
+      await api.calibrateSinglePrior(ticker, smileModel);
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
+
   propagate: async () => {
     const {
-      lambda, eta, shockNudges, alphaOverrides, graphData,
+      lambda, eta, lambdaPrior, useBidAskFit, smileModel, shockNudges, alphaOverrides, graphData,
       observedTickers, excludedQuotes, addedQuotes,
     } = get();
     const seq = ++_propagateSeq;
@@ -261,6 +343,9 @@ export const useEngine = create<EngineState>((set, get) => ({
       const result = await api.solve({
         lambda_: lambda,
         eta: eta,
+        lambda_prior: lambdaPrior,
+        use_bid_ask_fit: useBidAskFit,
+        smile_model: smileModel,
         shock_nudges: Object.keys(shockNudges).length > 0 ? shockNudges : null,
         alpha_overrides:
           Object.keys(alphaOverrides).length > 0 ? alphaOverrides : null,
@@ -289,9 +374,35 @@ export const useEngine = create<EngineState>((set, get) => ({
     }
   },
 
-  setSelectedNode: (ticker) => set({ selectedNode: ticker }),
-  setLambda: (v) => set({ lambda: v }),
-  setEta: (v) => set({ eta: v }),
+  setSelectedNode: (ticker) => {
+    set({ selectedNode: ticker });
+    if (ticker && Object.keys(get().quotes).length > 0) {
+      get().calibrateSinglePrior(ticker);
+      if (get().observedTickers.includes(ticker)) {
+        get().fitSingleAsset(ticker);
+      }
+    }
+  },
+  setLambda: (v) => {
+    set({ lambda: v });
+    _recalcSelected(get);
+  },
+  setEta: (v) => {
+    set({ eta: v });
+    _recalcSelected(get);
+  },
+  setLambdaPrior: (v) => {
+    set({ lambdaPrior: v });
+    _recalcSelected(get);
+  },
+  setUseBidAskFit: (v) => {
+    set({ useBidAskFit: v });
+    _recalcSelected(get);
+  },
+  setSmileModel: (model) => {
+    set({ smileModel: model });
+    _recalcSelected(get);
+  },
 
   setShockNudge: (ticker, nudge) =>
     set((s) => ({
@@ -342,8 +453,7 @@ export const useEngine = create<EngineState>((set, get) => ({
         },
       };
     });
-    // Re-propagate with updated exclusions
-    get().fit();
+    get().fitSingleAsset(ticker);
   },
 
   resetExclusions: (ticker) => {
@@ -351,7 +461,7 @@ export const useEngine = create<EngineState>((set, get) => ({
       const { [ticker]: _, ...rest } = s.excludedQuotes;
       return { excludedQuotes: rest };
     });
-    get().fit();
+    get().fitSingleAsset(ticker);
   },
 
   togglePriorQuotePoint: (ticker, index) =>
@@ -375,7 +485,7 @@ export const useEngine = create<EngineState>((set, get) => ({
         [ticker]: [...(s.addedQuotes[ticker] ?? []), [strike, iv]],
       },
     }));
-    get().fit();
+    get().fitSingleAsset(ticker);
   },
 
   removeAddedQuote: (ticker, index) => {
@@ -388,7 +498,7 @@ export const useEngine = create<EngineState>((set, get) => ({
         },
       };
     });
-    get().fit();
+    get().fitSingleAsset(ticker);
   },
 
   resetAdditions: (ticker) => {
@@ -396,7 +506,7 @@ export const useEngine = create<EngineState>((set, get) => ({
       const { [ticker]: _, ...rest } = s.addedQuotes;
       return { addedQuotes: rest };
     });
-    get().fit();
+    get().fitSingleAsset(ticker);
   },
 
   resetPriorExclusions: (ticker) =>
