@@ -1,11 +1,11 @@
 import { useRef, useCallback, useEffect, useMemo } from "react";
 
 interface SviParams {
-  a: number;
-  b: number;
-  rho: number;
-  m: number;
-  sigma: number;
+  v: number;        // ATM implied variance
+  psi_hat: number;  // normalized ATM skew
+  p_hat: number;    // normalized put wing slope
+  c_hat: number;    // normalized call wing slope
+  vt_ratio: number; // min-variance / ATM-variance ratio
 }
 
 interface Props {
@@ -48,11 +48,11 @@ interface ParamDef {
 }
 
 const PARAM_DEFS: ParamDef[] = [
-  { key: "a",     label: "a (level)",     hardMin: 0,      hardMax: 1.0,   halfWidth: 0.01,  nSteps: 200, fmt: (v) => v.toFixed(5) },
-  { key: "b",     label: "b (wings)",     hardMin: 0,      hardMax: 1.0,   halfWidth: 0.1,   nSteps: 200, fmt: (v) => v.toFixed(4) },
-  { key: "rho",   label: "\u03C1 (skew)", hardMin: -0.999, hardMax: 0.999, halfWidth: 0.2,   nSteps: 200, fmt: (v) => v.toFixed(3) },
-  { key: "m",     label: "m (shift)",     hardMin: -0.5,   hardMax: 0.5,   halfWidth: 0.05,  nSteps: 200, fmt: (v) => v.toFixed(4) },
-  { key: "sigma", label: "\u03C3 (curv)", hardMin: 0.001,  hardMax: 2.0,   halfWidth: 0.1,   nSteps: 200, fmt: (v) => v.toFixed(4) },
+  { key: "v",        label: "ATM Var (v)",        hardMin: 0.001,  hardMax: 1.0,   halfWidth: 0.02,  nSteps: 200, fmt: (v) => (v * 100).toFixed(1) + "%" },
+  { key: "psi_hat",  label: "Skew (\u03C8\u0302)",      hardMin: -5.0,   hardMax: 5.0,   halfWidth: 0.5,   nSteps: 200, fmt: (v) => v.toFixed(3) },
+  { key: "p_hat",    label: "Put Wing (p\u0302)",  hardMin: 0.01,   hardMax: 10.0,  halfWidth: 0.5,   nSteps: 200, fmt: (v) => v.toFixed(3) },
+  { key: "c_hat",    label: "Call Wing (c\u0302)", hardMin: 0.01,   hardMax: 10.0,  halfWidth: 0.5,   nSteps: 200, fmt: (v) => v.toFixed(3) },
+  { key: "vt_ratio", label: "Min-Var Ratio",      hardMin: 0.0,    hardMax: 1.0,   halfWidth: 0.1,   nSteps: 200, fmt: (v) => v.toFixed(3) },
 ];
 
 export default function SviSliders({ values, baseValues, onChange, onReset }: Props) {

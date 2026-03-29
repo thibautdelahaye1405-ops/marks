@@ -86,7 +86,7 @@ class DistributionView(BaseModel):
     lqd_u: List[float]
     lqd_psi: List[Optional[float]]
     beta: Optional[List[float]] = None
-    basis_labels: List[str] = ["Level (a)", "Wings (b)", "Skew (rho)", "Shift (m)", "Curvature (sig)"]
+    basis_labels: List[str] = ["ATM Var (v)", "Skew (\u03c8\u0302)", "Put Wing (p\u0302)", "Call Wing (c\u0302)", "Min-Var Ratio"]
     fit_forward: Optional[float] = None  # the forward the SVI was fitted with
 
 
@@ -111,11 +111,11 @@ class FitRequest(BaseModel):
 
 
 class SviOverrideRequest(BaseModel):
-    a: float
-    b: float
-    rho: float
-    m: float
-    sigma: float
+    v: float          # ATM implied variance
+    psi_hat: float    # normalized ATM skew
+    p_hat: float      # normalized put wing slope
+    c_hat: float      # normalized call wing slope
+    vt_ratio: float   # min-variance / ATM-variance ratio
 
 
 class SavePriorRequest(BaseModel):

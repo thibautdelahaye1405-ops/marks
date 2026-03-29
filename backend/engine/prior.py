@@ -59,6 +59,16 @@ def bs_prior(sigma_atm: float, T: float, grid: np.ndarray) -> dict:
         "forward": 100.0, "T": float(T),
     }
 
+    # Normalized SVI-JW parameters for propagation encoding.
+    # Flat vol → degenerate JW: no skew, symmetric default wings.
+    jw_params = {
+        "v": float(sigma_atm ** 2),
+        "vt_ratio": 1.0,
+        "psi_hat": 0.0,
+        "p_hat": 0.5,
+        "c_hat": 0.5,
+    }
+
     return {
         "psi0": psi0,
         "m": m,
@@ -67,6 +77,7 @@ def bs_prior(sigma_atm: float, T: float, grid: np.ndarray) -> dict:
         "Q": Q,
         "Q_prime": Q_prime,
         "_svi_params": svi_params,
+        "_jw_params": jw_params,
     }
 
 
@@ -99,6 +110,11 @@ def fit_lqd_prior(
     # Fit SVI
     svi_params = fit_svi(filt_strikes, filt_ivs, forward, T)
 
+    from .svi import raw_svi_to_jw_normalized
+    jw_params = raw_svi_to_jw_normalized(
+        svi_params["a"], svi_params["b"], svi_params["rho"],
+        svi_params["m"], svi_params["sigma"], T)
+
     # ATM IV from SVI
     atm_iv = float(svi_params["iv_fitted"][np.argmin(np.abs(filt_strikes - forward))])
     if atm_iv < 0.01:
@@ -112,6 +128,7 @@ def fit_lqd_prior(
         "beta_fit": np.zeros(phi.shape[0]),  # no LQD beta — SVI handles the smile
         "_bs_base": base,
         "_svi_params": svi_params,           # SVI fit for IV display
+        "_jw_params": jw_params,
         "_fit_strikes": strikes,
     }
 

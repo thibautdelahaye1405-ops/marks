@@ -29,6 +29,104 @@ def svi_implied_vol(k: np.ndarray, T: float, a: float, b: float, rho: float,
     return np.sqrt(w / max(T, 1e-8))
 
 
+def raw_svi_to_jw_normalized(a: float, b: float, rho: float,
+                              m_svi: float, sigma: float, T: float) -> dict:
+    """Convert raw SVI {a,b,rho,m,sigma} to normalized SVI-JW parameters.
+
+    Returns:
+        v:        ATM implied variance (w(0)/T)
+        vt_ratio: min-variance / ATM-variance ratio (in [0,1])
+        psi_hat:  normalized ATM skew
+        p_hat:    normalized put wing slope (>0)
+        c_hat:    normalized call wing slope (>0)
+    """
+    # ATM total variance: w(0) = a + b*(-rho*m + sqrt(m^2 + sigma^2))
+    w_atm = a + b * (-rho * m_svi + np.sqrt(m_svi**2 + sigma**2))
+    v = w_atm / max(T, 1e-8)
+
+    # Minimum total variance: w_min = a + b*sigma*sqrt(1 - rho^2)
+    w_min = a + b * sigma * np.sqrt(1.0 - rho**2)
+    v_tilde = w_min / max(T, 1e-8)
+    vt_ratio = np.clip(v_tilde / max(v, 1e-12), 0.0, 1.0)
+
+    # sqrt(v*T) factor for normalization
+    sqrt_vT = np.sqrt(max(v * T, 1e-16))
+
+    # Normalized wing slopes
+    p_hat = b * (1.0 - rho) / max(sqrt_vT, 1e-12)
+    c_hat = b * (1.0 + rho) / max(sqrt_vT, 1e-12)
+
+    # beta = m / sqrt(m^2 + sigma^2)
+    denom = np.sqrt(m_svi**2 + sigma**2)
+    beta = m_svi / max(denom, 1e-12) if denom > 1e-12 else 0.0
+
+    # Normalized ATM skew: psi_hat = (rho - beta) * b / sqrt(v*T)
+    psi_hat = (rho - beta) * b / max(sqrt_vT, 1e-12)
+
+    # Ensure wings are positive (they should be by construction)
+    p_hat = max(p_hat, 1e-6)
+    c_hat = max(c_hat, 1e-6)
+
+    return {
+        "v": float(v),
+        "vt_ratio": float(vt_ratio),
+        "psi_hat": float(psi_hat),
+        "p_hat": float(p_hat),
+        "c_hat": float(c_hat),
+    }
+
+
+def jw_normalized_to_raw_svi(v: float, vt_ratio: float, psi_hat: float,
+                              p_hat: float, c_hat: float, T: float) -> dict:
+    """Convert normalized SVI-JW parameters back to raw SVI {a,b,rho,m,sigma}.
+
+    Based on the algebraic inversion from SVI-JW-normalized.tex.
+    """
+    eps = 1e-8
+    v = max(v, eps)
+    T = max(T, eps)
+    v_tilde = vt_ratio * v
+
+    # Time/vol independent variables
+    wing_sum = p_hat + c_hat
+    wing_sum = max(wing_sum, eps)
+
+    rho = (c_hat - p_hat) / wing_sum
+    beta = (c_hat - p_hat - 2.0 * psi_hat) / wing_sum
+    beta = np.clip(beta, -0.99999, 0.99999)
+
+    # Scale-dependent
+    sqrt_vT = np.sqrt(v * T)
+    b = 0.5 * wing_sum * sqrt_vT
+
+    # sigma (with singularity guard when v ≈ v_tilde)
+    if (v - v_tilde) < eps:
+        sigma = 1e-4
+    else:
+        denom_term1 = (1.0 - rho * beta) / np.sqrt(1.0 - beta**2)
+        denom_term2 = np.sqrt(1.0 - rho**2)
+        denominator = wing_sum * (denom_term1 - denom_term2)
+        if abs(denominator) < eps:
+            sigma = 1e-4
+        else:
+            sigma = np.sqrt(T / v) * (2.0 * (v - v_tilde) / denominator)
+
+    sigma = max(sigma, 1e-4)
+
+    # Translation
+    m = beta * sigma / np.sqrt(1.0 - beta**2)
+    a = v_tilde * T - b * sigma * np.sqrt(1.0 - rho**2)
+
+    # Clamp to valid raw SVI ranges
+    a = float(np.clip(a, -0.05, 0.15))
+    b = float(np.clip(b, 0.0, 0.50))
+    rho = float(np.clip(rho, -0.999, 0.999))
+    m = float(np.clip(m, -0.20, 0.20))
+    sigma = float(np.clip(sigma, 1e-4, 1.0))
+
+    return {"a": a, "b": b, "rho": rho, "m": m, "sigma": sigma}
+
+
 def fit_svi(strikes: np.ndarray, mid_ivs: np.ndarray, forward: float, T: float,
             weights: np.ndarray = None) -> dict:
     """
@@ -103,6 +201,14 @@ def fit_svi(strikes: np.ndarray, mid_ivs: np.ndarray, forward: float, T: float,
         "forward": float(forward),
         "T": float(T),
     }
+
+
+def fit_svi_jw(strikes: np.ndarray, mid_ivs: np.ndarray, forward: float, T: float,
+               weights: np.ndarray = None) -> dict:
+    """Fit SVI to market data, return both raw SVI and normalized JW parameters."""
+    raw = fit_svi(strikes, mid_ivs, forward, T, weights)
+    jw = raw_svi_to_jw_normalized(raw["a"], raw["b"], raw["rho"], raw["m"], raw["sigma"], T)
+    return {**raw, "_jw": jw}
 
 
 def svi_iv_at_strikes(svi_params: dict, strikes: np.ndarray,

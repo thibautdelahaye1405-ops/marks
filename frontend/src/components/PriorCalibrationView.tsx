@@ -16,8 +16,8 @@ export default function PriorCalibrationView() {
   } = useEngine();
   const [priorView, setPriorView] = useState<DistributionView | null>(null);
   const [currentView, setCurrentView] = useState<DistributionView | null>(null);
-  const [sviParams, setSviParams] = useState<{ a: number; b: number; rho: number; m: number; sigma: number } | null>(null);
-  const [baseSviParams, setBaseSviParams] = useState<{ a: number; b: number; rho: number; m: number; sigma: number } | null>(null);
+  const [sviParams, setSviParams] = useState<{ v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number } | null>(null);
+  const [baseSviParams, setBaseSviParams] = useState<{ v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number } | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("smile");
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
 
@@ -44,7 +44,7 @@ export default function PriorCalibrationView() {
     setCurrentView(view);
     const b = view.beta;
     if (b && b.length >= 5) {
-      setSviParams({ a: b[0], b: b[1], rho: b[2], m: b[3], sigma: b[4] });
+      setSviParams({ v: b[0], psi_hat: b[1], p_hat: b[2], c_hat: b[3], vt_ratio: b[4] });
     }
   }, []);
 
@@ -53,7 +53,7 @@ export default function PriorCalibrationView() {
     setCurrentView(view);
     const b = view.beta;
     if (b && b.length >= 5) {
-      const p = { a: b[0], b: b[1], rho: b[2], m: b[3], sigma: b[4] };
+      const p = { v: b[0], psi_hat: b[1], p_hat: b[2], c_hat: b[3], vt_ratio: b[4] };
       setSviParams(p);
       setBaseSviParams(p);
     }
@@ -99,7 +99,7 @@ export default function PriorCalibrationView() {
       // Extract SVI params from beta field (a, b, rho, m, sigma)
       const b = view.beta;
       if (b && b.length >= 5) {
-        const p = { a: b[0], b: b[1], rho: b[2], m: b[3], sigma: b[4] };
+        const p = { v: b[0], psi_hat: b[1], p_hat: b[2], c_hat: b[3], vt_ratio: b[4] };
         setSviParams(p);
         setBaseSviParams(p);
       }
@@ -121,7 +121,7 @@ export default function PriorCalibrationView() {
   }, [ticker, isObserved, excludedPriorQuotes, addedPriorQuotes, _updateViewAndBase]);
 
   const handleSviChange = useCallback(
-    (params: { a: number; b: number; rho: number; m: number; sigma: number }) => {
+    (params: { v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number }) => {
       if (!ticker) return;
       setSviParams(params);
       api.sviOverridePrior(ticker, params).then(setCurrentView).catch(() => {});
@@ -428,7 +428,7 @@ export default function PriorCalibrationView() {
       {sviParams && (
         <div style={{ padding: "0 16px", borderTop: "1px solid #334155", marginTop: 4, paddingTop: 8 }}>
           <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
-            SVI Parameters
+            SVI-JW Parameters
           </div>
           <SviSliders
             values={sviParams}

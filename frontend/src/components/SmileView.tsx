@@ -56,14 +56,14 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
   }, [modelFwd, handleFwdChange]);
 
   // SVI parameter override state
-  const [sviParams, setSviParams] = useState<{ a: number; b: number; rho: number; m: number; sigma: number } | null>(null);
-  const [baseSviParams, setBaseSviParams] = useState<{ a: number; b: number; rho: number; m: number; sigma: number } | null>(null);
+  const [sviParams, setSviParams] = useState<{ v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number } | null>(null);
+  const [baseSviParams, setBaseSviParams] = useState<{ v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number } | null>(null);
   const [overriddenSmile, setOverriddenSmile] = useState<SmileData | null>(null);
 
   // Extract SVI params from solve result
   useEffect(() => {
     if (smileData?.beta && smileData.beta.length >= 5 && smileData.is_observed) {
-      const p = { a: smileData.beta[0], b: smileData.beta[1], rho: smileData.beta[2], m: smileData.beta[3], sigma: smileData.beta[4] };
+      const p = { v: smileData.beta[0], psi_hat: smileData.beta[1], p_hat: smileData.beta[2], c_hat: smileData.beta[3], vt_ratio: smileData.beta[4] };
       setSviParams(p);
       // Only update base when forward is NOT overridden — so slider shows delta
       if (fwdOverride == null) {
@@ -74,7 +74,7 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
   }, [smileData, fwdOverride]);
 
   const handleSviChange = useCallback(
-    (params: { a: number; b: number; rho: number; m: number; sigma: number }) => {
+    (params: { v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number }) => {
       if (!ticker) return;
       setSviParams(params);
       api.sviOverrideSmile(ticker, params).then((result) => {
@@ -305,7 +305,7 @@ export default function SmileView({ smileData, quoteData, ticker }: Props) {
       {sviParams && displaySmile?.is_observed && (
         <div style={{ padding: "0 16px", borderTop: "1px solid #334155", marginTop: 4, paddingTop: 8 }}>
           <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
-            SVI Parameters
+            SVI-JW Parameters
           </div>
           <SviSliders
             values={sviParams}

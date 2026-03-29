@@ -215,60 +215,87 @@ def run_marking(
     # Reconstruct marked smiles
     # Observed nodes: direct SVI fit to market quotes
     # Unobserved nodes: prior SVI + propagated SVI deltas from observed nodes
-    from .svi import svi_iv_at_strikes, svi_implied_vol, fit_svi, filter_quotes_for_fit
+    # --- SVI-JW Normalized Propagation ---
+    # Encoding scheme:
+    #   v (ATM var):     ln(v_mkt / v_prior)           — log-ratio (level channel)
+    #   psi_hat (skew):  (psi_mkt - psi_prior) / ref   — clamped-reference (signed param)
+    #   p_hat (put wing): ln(p_mkt / p_prior)           — log-ratio
+    #   c_hat (call wing): ln(c_mkt / c_prior)          — log-ratio
+    #   vt_ratio (min-var ratio): ln(vtr_mkt / vtr_prior) — log-ratio
+    #
+    # Two propagation channels through same P matrix:
+    #   Channel 0: level (v only)
+    #   Channel 1-4: shape (psi_hat, p_hat, c_hat, vt_ratio)
 
-    SVI_KEYS = ["a", "b", "rho", "m", "sigma"]
-    # Propagation mode per param: "prop" = proportional (ratio), "abs" = absolute (diff)
-    SVI_MODES = ["prop", "prop", "abs", "abs", "prop"]
+    from .svi import (svi_iv_at_strikes, svi_implied_vol, fit_svi, filter_quotes_for_fit,
+                      raw_svi_to_jw_normalized, jw_normalized_to_raw_svi)
 
-    # Max proportional change magnitude (±5x = 500%)
-    PROP_CAP = 5.0
+    JW_KEYS = ["v", "psi_hat", "p_hat", "c_hat", "vt_ratio"]
+    # Skew threshold: below this |psi_hat|, encoding switches from relative to absolute
+    SKEW_EPS = 0.1
+    # Log-ratio cap (prevents extreme propagation)
+    LOG_CAP = 2.0
 
-    def _svi_encode(market: dict, prior: dict) -> np.ndarray:
-        """Encode the market-vs-prior change in propagation space.
+    def _jw_encode(market_jw: dict, prior_jw: dict) -> np.ndarray:
+        """Encode market-vs-prior change in normalized JW propagation space.
 
-        Proportional params: g = clamp(market/prior - 1, ±PROP_CAP)
-        Absolute params:     g = market - prior
+        Log-ratio for positive params (v, p_hat, c_hat, vt_ratio).
+        Clamped-reference for signed params (psi_hat).
         """
         g = np.zeros(5)
-        for j, (k, mode) in enumerate(zip(SVI_KEYS, SVI_MODES)):
-            mv = market.get(k, 0.0)
-            pv = prior.get(k, 0.0)
-            if mode == "prop":
-                if abs(pv) > 1e-8:
-                    g[j] = np.clip(mv / pv - 1.0, -PROP_CAP, PROP_CAP)
-                else:
-                    # Prior is ~0: fall back to absolute diff, capped
-                    g[j] = np.clip(mv - pv, -PROP_CAP, PROP_CAP)
-            else:
-                g[j] = mv - pv
+        # v: log-ratio
+        g[0] = np.clip(np.log(max(market_jw["v"], 1e-10) / max(prior_jw["v"], 1e-10)),
+                        -LOG_CAP, LOG_CAP)
+        # psi_hat: clamped-reference encoding
+        ref = max(abs(prior_jw["psi_hat"]), SKEW_EPS)
+        g[1] = np.clip((market_jw["psi_hat"] - prior_jw["psi_hat"]) / ref,
+                        -LOG_CAP, LOG_CAP)
+        # p_hat: log-ratio
+        g[2] = np.clip(np.log(max(market_jw["p_hat"], 1e-10) / max(prior_jw["p_hat"], 1e-10)),
+                        -LOG_CAP, LOG_CAP)
+        # c_hat: log-ratio
+        g[3] = np.clip(np.log(max(market_jw["c_hat"], 1e-10) / max(prior_jw["c_hat"], 1e-10)),
+                        -LOG_CAP, LOG_CAP)
+        # vt_ratio: log-ratio
+        g[4] = np.clip(np.log(max(market_jw["vt_ratio"], 1e-10) / max(prior_jw["vt_ratio"], 1e-10)),
+                        -LOG_CAP, LOG_CAP)
         return g
 
-    def _svi_decode(prior: dict, g: np.ndarray) -> dict:
-        """Apply propagated change vector to a prior SVI → new SVI params.
+    def _jw_decode(prior_jw: dict, g: np.ndarray, T: float) -> dict:
+        """Apply propagated JW change vector to a prior → new raw SVI params.
 
-        Proportional params: new = prior * (1 + g)
-        Absolute params:     new = prior + g
-        Then clamp to valid SVI ranges.
+        Decodes from propagation space, converts back to raw SVI.
         """
-        out = {**prior}
-        for j, (k, mode) in enumerate(zip(SVI_KEYS, SVI_MODES)):
-            pv = prior.get(k, 0.0)
-            if mode == "prop":
-                out[k] = pv * (1.0 + np.clip(g[j], -PROP_CAP, PROP_CAP))
-            else:
-                out[k] = pv + g[j]
-        # Clamp to valid SVI ranges (fit_svi bounds: a∈[0,0.1], b∈[0,0.5], σ∈[1e-4,1])
-        out["a"] = float(np.clip(out["a"], 0.0, 0.15))
-        out["b"] = float(np.clip(out["b"], 0.0, 0.50))
-        out["rho"] = float(np.clip(out["rho"], -0.999, 0.999))
-        out["m"] = float(np.clip(out["m"], -0.20, 0.20))
-        out["sigma"] = float(np.clip(out["sigma"], 1e-4, 1.0))
-        return out
+        g = np.clip(g, -LOG_CAP, LOG_CAP)
 
-    # --- Phase A: fit SVI for observed nodes, encode changes ---
-    obs_svi_encoded = {}  # ticker -> np.array (5,) in propagation space
+        # v: exp decode
+        v_new = prior_jw["v"] * np.exp(g[0])
+        v_new = max(v_new, 1e-8)
+
+        # psi_hat: clamped-reference decode
+        ref = max(abs(prior_jw["psi_hat"]), SKEW_EPS)
+        psi_new = prior_jw["psi_hat"] + ref * g[1]
+
+        # p_hat: exp decode
+        p_new = prior_jw["p_hat"] * np.exp(g[2])
+        p_new = max(p_new, 1e-6)
+
+        # c_hat: exp decode
+        c_new = prior_jw["c_hat"] * np.exp(g[3])
+        c_new = max(c_new, 1e-6)
+
+        # vt_ratio: exp decode, clamp to [0, 1]
+        vtr_new = prior_jw["vt_ratio"] * np.exp(g[4])
+        vtr_new = float(np.clip(vtr_new, 0.0, 1.0))
+
+        # Convert back to raw SVI
+        raw = jw_normalized_to_raw_svi(v_new, vtr_new, psi_new, p_new, c_new, T)
+        return raw
+
+    # --- Phase A: fit SVI for observed nodes, convert to JW, encode changes ---
+    obs_jw_encoded = {}   # ticker -> np.array(5,) in JW propagation space
     obs_svi_fitted = {}   # ticker -> dict (full SVI params)
+    obs_jw_fitted = {}    # ticker -> dict (JW params)
 
     for v_idx, ticker in enumerate(tickers):
         if ticker not in quotes:
@@ -282,18 +309,29 @@ def run_marking(
             market_svi = fit_svi(filt_k, filt_iv, q.forward, q.T)
             obs_svi_fitted[ticker] = market_svi
 
-            if svi_prior:
-                obs_svi_encoded[ticker] = _svi_encode(market_svi, svi_prior)
-            else:
-                # No prior SVI (shouldn't happen with bs_prior fix, but defensive)
-                # Encode as absolute change from a flat prior at market ATM level
-                atm_w = market_svi["a"]
-                flat_prior = {"a": atm_w, "b": 0.0, "rho": 0.0, "m": 0.0, "sigma": 0.1}
-                obs_svi_encoded[ticker] = _svi_encode(market_svi, flat_prior)
+            # Convert both market and prior to normalized JW
+            market_jw = raw_svi_to_jw_normalized(
+                market_svi["a"], market_svi["b"], market_svi["rho"],
+                market_svi["m"], market_svi["sigma"], q.T)
+            obs_jw_fitted[ticker] = market_jw
 
-    # --- Phase B: propagate encoded changes to unobserved nodes ---
-    # P = (I - W_UU)^{-1} W_UO applied to the encoded change vectors
-    unobs_svi_propagated = {}  # ticker -> np.array (5,) in propagation space
+            if svi_prior:
+                prior_jw = raw_svi_to_jw_normalized(
+                    svi_prior["a"], svi_prior["b"], svi_prior["rho"],
+                    svi_prior["m"], svi_prior["sigma"],
+                    svi_prior.get("T", q.T))
+                # Store JW on prior for decode phase
+                p["_jw_params"] = prior_jw
+                obs_jw_encoded[ticker] = _jw_encode(market_jw, prior_jw)
+            else:
+                # No prior SVI — encode against flat prior
+                flat_jw = {"v": market_jw["v"], "vt_ratio": 1.0,
+                           "psi_hat": 0.0, "p_hat": 0.5, "c_hat": 0.5}
+                p["_jw_params"] = flat_jw
+                obs_jw_encoded[ticker] = _jw_encode(market_jw, flat_jw)
+
+    # --- Phase B: propagate JW-encoded changes to unobserved nodes ---
+    unobs_jw_propagated = {}  # ticker -> np.array(5,) in JW propagation space
     if P is not None and len(parts["unobs_idx"]) > 0 and len(parts["obs_idx"]) > 0:
         obs_tickers_ordered = [tickers[i] for i in parts["obs_idx"]]
         unobs_tickers_ordered = [tickers[i] for i in parts["unobs_idx"]]
@@ -301,14 +339,14 @@ def run_marking(
         # Stack encoded changes matching P's column order
         g_O = np.zeros((len(obs_tickers_ordered), 5))
         for j, t in enumerate(obs_tickers_ordered):
-            if t in obs_svi_encoded:
-                g_O[j] = obs_svi_encoded[t]
+            if t in obs_jw_encoded:
+                g_O[j] = obs_jw_encoded[t]
 
         # Propagate: g_U = P @ g_O  (shape: N_unobs x 5)
         g_U = P @ g_O
 
         for i, t in enumerate(unobs_tickers_ordered):
-            unobs_svi_propagated[t] = g_U[i]
+            unobs_jw_propagated[t] = g_U[i]
 
     # --- Phase C: build display smiles ---
     nodes = {}
@@ -354,22 +392,44 @@ def run_marking(
             iv_marked = svi_iv_at_strikes(market_svi, strikes, q.forward, q.T)
             iv_marked = np.clip(iv_marked, 0.01, 5.0)
             iv_marked = np.where(np.isfinite(iv_marked), iv_marked, np.nan)
-            node_beta = np.array([market_svi.get(k, 0) for k in SVI_KEYS])
-        elif ticker in unobs_svi_propagated and svi_params is not None:
-            # UNOBSERVED: decode propagated change onto this asset's prior SVI
-            prop_svi = _svi_decode(svi_params, unobs_svi_propagated[ticker])
-            # Ensure forward/T are set for correct moneyness computation
-            prop_svi["forward"] = forward
-            prop_svi["T"] = T
+            market_jw = obs_jw_fitted.get(ticker)
+            if market_jw is None:
+                market_jw = raw_svi_to_jw_normalized(
+                    market_svi["a"], market_svi["b"], market_svi["rho"],
+                    market_svi["m"], market_svi["sigma"], q.T)
+            node_beta = np.array([market_jw["v"], market_jw["psi_hat"], market_jw["p_hat"], market_jw["c_hat"], market_jw["vt_ratio"]])
+        elif ticker in unobs_jw_propagated and svi_params is not None:
+            # UNOBSERVED: decode propagated JW change onto this asset's prior
+            prior_jw = priors[ticker].get("_jw_params")
+            if prior_jw is None:
+                # Compute JW from raw prior SVI
+                prior_jw = raw_svi_to_jw_normalized(
+                    svi_params["a"], svi_params["b"], svi_params["rho"],
+                    svi_params["m"], svi_params["sigma"],
+                    svi_params.get("T", T))
+
+            prop_raw = _jw_decode(prior_jw, unobs_jw_propagated[ticker], T)
+            prop_svi = {**prop_raw, "forward": forward, "T": T}
 
             iv_marked = svi_iv_at_strikes(prop_svi, strikes, forward, T)
             iv_marked = np.clip(iv_marked, 0.01, 5.0)
             iv_marked = np.where(np.isfinite(iv_marked), iv_marked, np.nan)
-            node_beta = np.array([prop_svi.get(k, 0) for k in SVI_KEYS])
+            # Compute JW from the propagated raw SVI
+            prop_jw = raw_svi_to_jw_normalized(
+                prop_raw["a"], prop_raw["b"], prop_raw["rho"],
+                prop_raw["m"], prop_raw["sigma"], T)
+            node_beta = np.array([prop_jw["v"], prop_jw["psi_hat"], prop_jw["p_hat"], prop_jw["c_hat"], prop_jw["vt_ratio"]])
         else:
             # No propagation data: show prior
             iv_marked = iv_prior_fitted.copy()
-            node_beta = np.array([svi_params.get(k, 0) for k in SVI_KEYS]) if svi_params else np.zeros(5)
+            jw = priors[ticker].get("_jw_params")
+            if jw:
+                node_beta = np.array([jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]])
+            elif svi_params:
+                fb_jw = raw_svi_to_jw_normalized(svi_params["a"], svi_params["b"], svi_params["rho"], svi_params["m"], svi_params["sigma"], svi_params.get("T", T))
+                node_beta = np.array([fb_jw["v"], fb_jw["psi_hat"], fb_jw["p_hat"], fb_jw["c_hat"], fb_jw["vt_ratio"]])
+            else:
+                node_beta = np.array([0.04, 0.0, 0.5, 0.5, 1.0])
 
         # Distance
         valid = np.isfinite(iv_marked) & np.isfinite(iv_prior_fitted)

@@ -374,18 +374,26 @@ def fit_endpoint(req: FitRequest):
                 market_svi = fit_svi(filt_k, filt_iv, forward, T)
                 iv_marked = svi_iv_at_strikes(market_svi, strikes, forward, T)
                 iv_marked = np.clip(iv_marked, 0.01, 5.0)
-                svi_beta = [market_svi.get("a", 0), market_svi.get("b", 0),
-                            market_svi.get("rho", 0), market_svi.get("m", 0),
-                            market_svi.get("sigma", 0.1)]
+                from ..engine.svi import raw_svi_to_jw_normalized
+                jw = raw_svi_to_jw_normalized(market_svi["a"], market_svi["b"], market_svi["rho"],
+                                              market_svi["m"], market_svi["sigma"], T)
+                svi_beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
             else:
                 iv_marked = iv_prior.copy()
-                svi_beta = [0.0] * 5
+                svi_beta = [0.04, 0.0, 0.5, 0.5, 1.0]
         else:
             # Unobserved: show prior as current smile
             iv_marked = iv_prior.copy()
-            svi_beta = [svi_prior.get("a", 0), svi_prior.get("b", 0),
-                        svi_prior.get("rho", 0), svi_prior.get("m", 0),
-                        svi_prior.get("sigma", 0.1)] if svi_prior else [0.0] * 5
+            jw_prior = prior.get("_jw_params") if prior else None
+            if jw_prior:
+                svi_beta = [jw_prior["v"], jw_prior["psi_hat"], jw_prior["p_hat"], jw_prior["c_hat"], jw_prior["vt_ratio"]]
+            elif svi_prior:
+                from ..engine.svi import raw_svi_to_jw_normalized
+                jw = raw_svi_to_jw_normalized(svi_prior["a"], svi_prior["b"], svi_prior["rho"],
+                                              svi_prior["m"], svi_prior["sigma"], svi_prior.get("T", T))
+                svi_beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
+            else:
+                svi_beta = [0.04, 0.0, 0.5, 0.5, 1.0]
 
         iv_prior_list = [float(v) if np.isfinite(v) else None for v in iv_prior]
         iv_marked_list = [float(v) if np.isfinite(v) else None for v in iv_marked]
@@ -673,13 +681,19 @@ def get_prior(ticker: str):
 
     view = compute_distribution_view(prior, grid, forward, T, _get_rate(T), phi=phi, market_strikes=chain.strikes if chain else None)
 
-    # Return SVI params as "beta" for the slider UI
-    svi = prior.get("_svi_params")
-    if svi:
-        beta = [svi.get("a", 0), svi.get("b", 0), svi.get("rho", 0),
-                svi.get("m", 0), svi.get("sigma", 0.1)]
+    # Return JW-normalized params as "beta" for the slider UI
+    jw = prior.get("_jw_params")
+    if jw:
+        beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
     else:
-        beta = [0.0] * 5
+        svi = prior.get("_svi_params")
+        if svi:
+            from ..engine.svi import raw_svi_to_jw_normalized
+            chain_T = chain.T if chain else 30 / 365
+            jw = raw_svi_to_jw_normalized(svi["a"], svi["b"], svi["rho"], svi["m"], svi["sigma"], chain_T)
+            beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
+        else:
+            beta = [0.04, 0.0, 0.5, 0.5, 1.0]  # flat vol defaults
 
     return DistributionView(
         moneyness=view["moneyness"],
@@ -723,9 +737,11 @@ def override_prior(ticker: str, req: PriorOverrideRequest):
     if np.all(np.abs(beta_adj) < 1e-12):
         _state["priors"][ticker] = base_prior
         view = compute_distribution_view(base_prior, grid, forward, T, _get_rate(T), phi=phi, market_strikes=chain.strikes if chain else None)
-        base_beta = base_prior.get("beta_fit", [0.0] * config.M)
-        if hasattr(base_beta, "tolist"):
-            base_beta = base_beta.tolist()
+        jw = base_prior.get("_jw_params")
+        if jw:
+            base_beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
+        else:
+            base_beta = [0.04, 0.0, 0.5, 0.5, 1.0]
         return DistributionView(
             moneyness=view["moneyness"], iv_curve=view["iv_curve"],
             cdf_x=view["cdf_x"], cdf_y=view["cdf_y"],
@@ -767,22 +783,28 @@ def svi_override_prior(ticker: str, req: SviOverrideRequest):
     forward = chain.forward if chain else 100.0
     T = chain.T if chain else 30 / 365
 
-    # Build new SVI params
+    from ..engine.svi import jw_normalized_to_raw_svi, raw_svi_to_jw_normalized
+
+    # Convert JW → raw SVI for evaluation
+    raw = jw_normalized_to_raw_svi(req.v, req.vt_ratio, req.psi_hat, req.p_hat, req.c_hat, T)
+
     old_svi = base_prior.get("_svi_params", {})
-    new_svi = {
-        **old_svi,
-        "a": req.a, "b": req.b, "rho": req.rho,
-        "m": req.m, "sigma": req.sigma,
-    }
+    new_svi = {**old_svi, **raw}
 
     # Rebuild the prior with new SVI
-    atm_iv_new = np.sqrt(max(req.a + req.b * (req.rho * (-req.m) + np.sqrt(req.m**2 + req.sigma**2)), 1e-8) / max(T, 1e-8))
+    from ..engine.svi import svi_total_variance
+    w_atm = svi_total_variance(np.array([0.0]), raw["a"], raw["b"], raw["rho"], raw["m"], raw["sigma"])[0]
+    atm_iv_new = np.sqrt(max(w_atm, 1e-8) / max(T, 1e-8))
     base = bs_prior(atm_iv_new, T, grid)
+
+    jw_params = {"v": req.v, "psi_hat": req.psi_hat, "p_hat": req.p_hat, "c_hat": req.c_hat, "vt_ratio": req.vt_ratio}
+
     updated = {
         **base,
         "beta_fit": np.zeros(config.M),
         "_bs_base": base,
         "_svi_params": new_svi,
+        "_jw_params": jw_params,
         "_fit_strikes": base_prior.get("_fit_strikes", np.array([])),
     }
 
@@ -795,32 +817,33 @@ def svi_override_prior(ticker: str, req: SviOverrideRequest):
         cdf_x=view["cdf_x"], cdf_y=view["cdf_y"],
         lqd_u=view["lqd_u"], lqd_psi=view["lqd_psi"],
         fit_forward=view.get("fit_forward"),
-        beta=[req.a, req.b, req.rho, req.m, req.sigma],
+        beta=[req.v, req.psi_hat, req.p_hat, req.c_hat, req.vt_ratio],
     )
 
 
 @router.post("/smile/{ticker}/svi-override")
 def svi_override_smile(ticker: str, req: SviOverrideRequest):
-    """Evaluate an SVI smile with given params and return IV curve at display strikes."""
+    """Evaluate a smile with given JW-normalized params at display strikes."""
     chain = _state["quotes"].get(ticker)
     if chain is None:
         raise HTTPException(status_code=404, detail=f"No quotes for {ticker}")
 
-    from ..engine.svi import svi_implied_vol
+    from ..engine.svi import jw_normalized_to_raw_svi, svi_implied_vol, svi_iv_at_strikes
 
     forward = chain.forward
     T = chain.T
-    fit_fwd = req.a  # Not used — we use the SVI's stored forward or chain forward
-    # Evaluate at full chain strikes
+
+    # Convert JW → raw SVI
+    raw = jw_normalized_to_raw_svi(req.v, req.vt_ratio, req.psi_hat, req.p_hat, req.c_hat, T)
+
     k = np.log(chain.strikes / forward)
-    iv_marked = svi_implied_vol(k, T, req.a, req.b, req.rho, req.m, req.sigma)
+    iv_marked = svi_implied_vol(k, T, raw["a"], raw["b"], raw["rho"], raw["m"], raw["sigma"])
     iv_marked = np.clip(iv_marked, 0.01, 5.0)
 
-    # Also get the prior for comparison
+    # Prior for comparison
     prior = _state["priors"].get(ticker)
     svi_prior = prior.get("_svi_params") if prior else None
     if svi_prior:
-        from ..engine.svi import svi_iv_at_strikes
         iv_prior = svi_iv_at_strikes(svi_prior, chain.strikes, forward, T)
         iv_prior = np.clip(iv_prior, 0.01, 5.0)
     else:
@@ -831,7 +854,7 @@ def svi_override_smile(ticker: str, req: SviOverrideRequest):
         "strikes": chain.strikes.tolist(),
         "iv_prior": [float(v) if np.isfinite(v) else None for v in iv_prior],
         "iv_marked": [float(v) if np.isfinite(v) else None for v in iv_marked],
-        "beta": [req.a, req.b, req.rho, req.m, req.sigma],
+        "beta": [req.v, req.psi_hat, req.p_hat, req.c_hat, req.vt_ratio],
         "is_observed": True,
     }
 
@@ -889,13 +912,18 @@ def refit_prior(ticker: str, req: PriorRefitRequest):
     forward = chain.forward
     view = compute_distribution_view(prior, grid, forward, chain.T, _get_rate(chain.T), phi=phi, market_strikes=chain.strikes if chain else None)
 
-    # Return SVI params (not LQD beta_fit) so the frontend sliders work
-    svi = prior.get("_svi_params")
-    if svi:
-        beta = [svi.get("a", 0), svi.get("b", 0), svi.get("rho", 0),
-                svi.get("m", 0), svi.get("sigma", 0.1)]
+    # Return JW-normalized params so the frontend sliders work
+    jw = prior.get("_jw_params")
+    if jw:
+        beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
     else:
-        beta = [0.0] * 5
+        svi = prior.get("_svi_params")
+        if svi:
+            from ..engine.svi import raw_svi_to_jw_normalized
+            jw = raw_svi_to_jw_normalized(svi["a"], svi["b"], svi["rho"], svi["m"], svi["sigma"], chain.T)
+            beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
+        else:
+            beta = [0.04, 0.0, 0.5, 0.5, 1.0]
 
     return DistributionView(
         moneyness=view["moneyness"],
@@ -1024,9 +1052,10 @@ def get_node_distribution(ticker: str):
                     marked_prior, grid, forward, T, _get_rate(T),
                     phi=phi, market_strikes=chain.strikes,
                 )
-                svi_beta = [market_svi.get("a", 0), market_svi.get("b", 0),
-                            market_svi.get("rho", 0), market_svi.get("m", 0),
-                            market_svi.get("sigma", 0.1)]
+                from ..engine.svi import raw_svi_to_jw_normalized
+                jw = raw_svi_to_jw_normalized(market_svi["a"], market_svi["b"], market_svi["rho"],
+                                              market_svi["m"], market_svi["sigma"], T)
+                svi_beta = [jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]]
                 marked_dv = DistributionView(
                     moneyness=marked_view["moneyness"],
                     iv_curve=marked_view["iv_curve"],

@@ -61,47 +61,42 @@
 
 ## 3. Smile Models
 
-### 3.1 SVI refinements
-- Current: raw SVI with 5 params, bounded optimisation
-- Extended SVI (eSSVI): adds inter-expiry consistency, natural for multi-maturity
-- SSVI (Surface SVI): Gatheral-Jacquier parametrisation ensuring no calendar arbitrage
-- Better initial guess from data moments
+### 3.1 SVI-JW Normalised ✅ DONE
+- Native parameterisation: {v, ψ̂, p̂, ĉ, ṽ/v} — ATM variance, normalised skew, put/call wings, min-var ratio
+- Normalisation: z = k/√(vτ) makes shape params stationary across term structure and vol regimes
+- Raw SVI {a,b,ρ,m,σ} is internal evaluation detail only — all UI/API uses JW
+- Bijective conversion raw↔JW with round-trip error at machine epsilon
+- Sliders: ATM Var (%), Skew (ψ̂), Put Wing (p̂), Call Wing (ĉ), Min-Var Ratio
+- Reference: `SVI-JW-normalized.tex`, `backend/engine/svi.py`
 
-### 3.2 Polynomial of Sigmoids
+### 3.2 LQD model ⭐ NEXT
+- LQD-native smile model as alternative to SVI
+- Basis expansion on quantile derivative: ψ(u) = ψ₀(u) + Σ βₘ φₘ(u)
+- Improved basis functions (M=7?), better tail handling
+- Model-agnostic propagation: same encode/decode pattern as SVI-JW
+
+### 3.3 Polynomial of Sigmoids ⭐ NEXT
 - Flexible parametric model: `σ(k) = Σ_i w_i * sigmoid(a_i * k + b_i) + c`
 - Naturally bounded (no negative variance)
 - Needs butterfly arbitrage constraint (density ≥ 0)
 - Number of sigmoids as a model order parameter
 
-### 3.3 LQD expansion improvements
-- Current: 5 basis functions (constant, 2 tail, 2 Legendre)
-- Add 2 more Legendre polynomials (M=7) for better interior resolution
-- Better boundary basis: replace -log(u) with smoother tail functions?
-- Role is now limited to propagation encoding (display uses SVI)
-
 ### 3.4 Model selection UI
-- Radio group in Modelling panel (SVI active, others greyed → implement)
-- Per-asset model choice (most assets SVI, some could use sigmoid)
+- Radio group in Modelling panel (SVI-JW active, others greyed → implement)
+- Per-asset model choice (most assets SVI-JW, some could use sigmoid or LQD)
 - Model-agnostic propagation: encode/decode pattern generalises across models
 
 ---
 
 ## 4. Propagation
 
-### 4.1 Current: raw SVI-space propagation ✅ DONE (with known limitations)
-- Encode: proportional for (a, b, σ), absolute for (ρ, m)
-- Propagate: P = (I - W_UU)⁻¹ W_UO applied to 5-vectors
-- Decode: apply to each unobserved prior SVI
-- Safeguards: proportional ratio capped at ±5x, decoded params clamped to fit_svi bounds
-- **Limitation**: raw SVI params are not orthogonal — level/shape not separated, params not normalised. Proportional encoding on `a` (total variance level) conflates variance level changes with shape changes.
-
-### 4.1b SVI-JW normalised propagation ⭐ NEXT
-- Replace raw SVI {a,b,ρ,m,σ} propagation with SVI-JW (Jump-Wing) parametrisation
-- JW params {v_t, ψ_t, p_t, c_t, ṽ_t}: ATM variance, ATM skew, put slope, call slope, min variance
-- Better separation: v_t controls level, (ψ_t, p_t, c_t) control shape orthogonally
-- Naturally normalised — all params are either variance-like or dimensionless slopes
-- v_t propagated proportionally, shape params propagated absolutely
-- Reference: Gatheral (2004) SVI-JW reparametrisation
+### 4.1 SVI-JW normalised propagation ✅ DONE
+- Two channels through same P matrix: level (v only) and shape (ψ̂, p̂, ĉ, ṽ/v)
+- Log-ratio encoding for positive params (v, p̂, ĉ, ṽ/v) — geometric averaging via P matrix
+- Clamped-reference encoding for skew (ψ̂): `Δψ̂/max(|ψ̂_prior|, ε)` with ε=0.1 — handles sign changes and near-zero skew gracefully
+- All encoded values capped at ±2.0
+- Decode: exp for log-ratio params, linear for skew, then JW→raw SVI for evaluation
+- File: `backend/engine/pipeline.py` (_jw_encode/_jw_decode)
 
 ### 4.2 Butterfly arbitrage safeguard
 - After propagation, check density non-negativity: `d²C/dK² ≥ 0`

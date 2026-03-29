@@ -100,13 +100,13 @@ export const api = {
   getNodeDistribution: (ticker: string) =>
     request<NodeDistributionResponse>(`/node/${ticker}/distribution`),
 
-  sviOverridePrior: (ticker: string, params: { a: number; b: number; rho: number; m: number; sigma: number }) =>
+  sviOverridePrior: (ticker: string, params: { v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number }) =>
     request<DistributionView>(`/prior/${ticker}/svi-override`, {
       method: "POST",
       body: JSON.stringify(params),
     }),
 
-  sviOverrideSmile: (ticker: string, params: { a: number; b: number; rho: number; m: number; sigma: number }) =>
+  sviOverrideSmile: (ticker: string, params: { v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number }) =>
     request<SmileData>(`/smile/${ticker}/svi-override`, {
       method: "POST",
       body: JSON.stringify(params),
