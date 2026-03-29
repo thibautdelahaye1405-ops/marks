@@ -99,8 +99,8 @@ def run_marking(
         W, alphas = build_influence_matrix(
             assets,
             alpha_overrides=alpha_overrides,
-            alpha_liquid=config.alpha_liquid,
-            alpha_illiquid=config.alpha_illiquid,
+            alpha_min=config.alpha_min,
+            alpha_max=config.alpha_max,
         )
 
     # Smoothness matrix Ω
@@ -221,18 +221,25 @@ def run_marking(
     # Propagation mode per param: "prop" = proportional (ratio), "abs" = absolute (diff)
     SVI_MODES = ["prop", "prop", "abs", "abs", "prop"]
 
+    # Max proportional change magnitude (±5x = 500%)
+    PROP_CAP = 5.0
+
     def _svi_encode(market: dict, prior: dict) -> np.ndarray:
         """Encode the market-vs-prior change in propagation space.
 
-        Proportional params: g = market/prior - 1  (fractional change)
-        Absolute params:     g = market - prior     (level shift)
+        Proportional params: g = clamp(market/prior - 1, ±PROP_CAP)
+        Absolute params:     g = market - prior
         """
         g = np.zeros(5)
         for j, (k, mode) in enumerate(zip(SVI_KEYS, SVI_MODES)):
             mv = market.get(k, 0.0)
             pv = prior.get(k, 0.0)
             if mode == "prop":
-                g[j] = (mv / pv - 1.0) if abs(pv) > 1e-12 else 0.0
+                if abs(pv) > 1e-8:
+                    g[j] = np.clip(mv / pv - 1.0, -PROP_CAP, PROP_CAP)
+                else:
+                    # Prior is ~0: fall back to absolute diff, capped
+                    g[j] = np.clip(mv - pv, -PROP_CAP, PROP_CAP)
             else:
                 g[j] = mv - pv
         return g
@@ -248,14 +255,15 @@ def run_marking(
         for j, (k, mode) in enumerate(zip(SVI_KEYS, SVI_MODES)):
             pv = prior.get(k, 0.0)
             if mode == "prop":
-                out[k] = pv * (1.0 + g[j])
+                out[k] = pv * (1.0 + np.clip(g[j], -PROP_CAP, PROP_CAP))
             else:
                 out[k] = pv + g[j]
-        # Clamp to valid SVI ranges
-        out["a"] = max(out["a"], 0.0)
-        out["b"] = max(out["b"], 0.0)
+        # Clamp to valid SVI ranges (fit_svi bounds: a∈[0,0.1], b∈[0,0.5], σ∈[1e-4,1])
+        out["a"] = float(np.clip(out["a"], 0.0, 0.15))
+        out["b"] = float(np.clip(out["b"], 0.0, 0.50))
         out["rho"] = float(np.clip(out["rho"], -0.999, 0.999))
-        out["sigma"] = max(out["sigma"], 1e-4)
+        out["m"] = float(np.clip(out["m"], -0.20, 0.20))
+        out["sigma"] = float(np.clip(out["sigma"], 1e-4, 1.0))
         return out
 
     # --- Phase A: fit SVI for observed nodes, encode changes ---
@@ -277,7 +285,11 @@ def run_marking(
             if svi_prior:
                 obs_svi_encoded[ticker] = _svi_encode(market_svi, svi_prior)
             else:
-                obs_svi_encoded[ticker] = np.zeros(5)
+                # No prior SVI (shouldn't happen with bs_prior fix, but defensive)
+                # Encode as absolute change from a flat prior at market ATM level
+                atm_w = market_svi["a"]
+                flat_prior = {"a": atm_w, "b": 0.0, "rho": 0.0, "m": 0.0, "sigma": 0.1}
+                obs_svi_encoded[ticker] = _svi_encode(market_svi, flat_prior)
 
     # --- Phase B: propagate encoded changes to unobserved nodes ---
     # P = (I - W_UU)^{-1} W_UO applied to the encoded change vectors
@@ -346,6 +358,9 @@ def run_marking(
         elif ticker in unobs_svi_propagated and svi_params is not None:
             # UNOBSERVED: decode propagated change onto this asset's prior SVI
             prop_svi = _svi_decode(svi_params, unobs_svi_propagated[ticker])
+            # Ensure forward/T are set for correct moneyness computation
+            prop_svi["forward"] = forward
+            prop_svi["T"] = T
 
             iv_marked = svi_iv_at_strikes(prop_svi, strikes, forward, T)
             iv_marked = np.clip(iv_marked, 0.01, 5.0)

@@ -9,6 +9,9 @@ import type {
   DistributionView,
   NodeDistributionResponse,
   SmileData,
+  CatalogResponse,
+  UniverseSelectResponse,
+  AddTickerResponse,
 } from "../types";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -25,6 +28,25 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   getUniverse: () => request<Asset[]>("/universe"),
+
+  getCatalog: () => request<CatalogResponse>("/catalog"),
+
+  selectUniverse: (tickers: string[]) =>
+    request<UniverseSelectResponse>("/universe/select", {
+      method: "POST",
+      body: JSON.stringify({ tickers }),
+    }),
+
+  addTicker: (ticker: string, name?: string, sector?: string) =>
+    request<AddTickerResponse>("/universe/add", {
+      method: "POST",
+      body: JSON.stringify({ ticker, name: name || "", sector: sector || "Other" }),
+    }),
+
+  saveUniverseSelection: () =>
+    request<{ status: string; tickers: string[] }>("/universe/save", {
+      method: "POST",
+    }),
 
   fetchQuotes: () =>
     request<Record<string, QuoteSnapshot>>("/fetch-quotes", { method: "POST" }),

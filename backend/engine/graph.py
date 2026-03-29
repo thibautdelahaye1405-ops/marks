@@ -24,8 +24,8 @@ def build_influence_matrix(
     assets: List[AssetDef],
     correlations: Optional[Dict[Tuple[str, str], float]] = None,
     alpha_overrides: Optional[Dict[str, float]] = None,
-    alpha_liquid: float = 0.1,
-    alpha_illiquid: float = 0.3,
+    alpha_min: float = 0.10,
+    alpha_max: float = 0.90,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build the influence matrix W for the asset universe (single maturity).
@@ -34,8 +34,8 @@ def build_influence_matrix(
         assets:           list of AssetDef
         correlations:     optional override for pairwise correlations
         alpha_overrides:  optional per-ticker self-trust overrides
-        alpha_liquid:     default self-trust for liquid nodes
-        alpha_illiquid:   default self-trust for illiquid nodes
+        alpha_min:        self-trust floor (least liquid nodes)
+        alpha_max:        self-trust cap   (most liquid nodes)
 
     Returns:
         W:      influence matrix, shape (N, N), dense (small enough for Phase 1)
@@ -46,6 +46,7 @@ def build_influence_matrix(
 
     tickers = [a.ticker for a in assets]
     liq = np.array([a.liquidity_score for a in assets])
+    liq_max = liq.max() if N > 0 else 1.0
 
     for i in range(N):
         for j in range(N):
@@ -63,15 +64,16 @@ def build_influence_matrix(
                 rho = get_correlation(ai.ticker, aj.ticker)
 
             # Base weight: |ρ| · liquidity asymmetry (eq.21)
-            # Node i is influenced by node j: liquid j influences illiquid i more
-            liq_weight = np.sqrt(liq[j] / (liq[i] + liq[j]))
-            w = abs(rho) * liq_weight
+            # W[i,j] = how much j pulls i.
+            # Liquid j → illiquid i: high.  Illiquid j → liquid i: low.
+            # Ratio (ℓ_j/ℓ_i) without sqrt for stronger asymmetry.
+            liq_ratio = liq[j] / (liq[i] + liq[j])
+            w = abs(rho) * liq_ratio
 
             # Index-constituent boost (eq.22)
+            # Only boost constituent influenced BY index, not the reverse.
             if aj.is_index and ai.index_weight > 0:
                 w *= (1.0 + ai.index_weight * 10.0)
-            elif ai.is_index and aj.index_weight > 0:
-                w *= (1.0 + aj.index_weight * 5.0)
 
             # Sector affinity boost
             if ai.sector == aj.sector and ai.sector != "Index":
@@ -79,15 +81,16 @@ def build_influence_matrix(
 
             W_raw[i, j] = w
 
-    # Self-trust α_v
+    # Self-trust α_v: continuous, proportional to liquidity
+    # Liquid nodes are mostly self-trusting (high α → small row sum).
+    # Illiquid nodes are heavily influenced by neighbours (low α → large row sum).
     alphas = np.zeros(N)
     for i, a in enumerate(assets):
         if alpha_overrides and a.ticker in alpha_overrides:
             alphas[i] = alpha_overrides[a.ticker]
-        elif a.liquidity_score >= 5.0:
-            alphas[i] = alpha_liquid
         else:
-            alphas[i] = alpha_illiquid
+            # Linear in liquidity: α_min at ℓ=0, α_max at ℓ=ℓ_max
+            alphas[i] = alpha_min + (alpha_max - alpha_min) * liq[i] / liq_max
 
     # Row normalisation: W_vw ← (1 - α_v) · W_vw / Σ_{w'} W_{vw'}  (eq.23 area)
     W = np.zeros_like(W_raw)

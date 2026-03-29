@@ -34,6 +34,7 @@ function App() {
     selectedNode,
     universe,
     fetchUniverse,
+    fetchCatalog,
     fetchGraph,
     setSelectedNode,
   } = useEngine();
@@ -50,9 +51,10 @@ function App() {
   const closeFetchPriors = useCallback(() => setFetchPriorsOpen(false), []);
 
   useEffect(() => {
+    fetchCatalog();
     fetchUniverse();
     fetchGraph();
-  }, [fetchUniverse, fetchGraph]);
+  }, [fetchCatalog, fetchUniverse, fetchGraph]);
 
   useEffect(() => {
     if (selectedNode) setDetailTab("smile");

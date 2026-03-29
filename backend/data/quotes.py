@@ -103,6 +103,26 @@ def _compute_parity_forward(call_prices, put_prices, strikes, r, T):
     return float(forward), float(k_star)
 
 
+def validate_ticker(ticker: str) -> Optional[Dict]:
+    """
+    Lightweight Yahoo Finance check: fetch spot price and name.
+    Returns {"name": str, "spot": float} on success, None if invalid.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        info = tk.info
+        spot = info.get("regularMarketPrice") or info.get("previousClose")
+        if spot is None:
+            hist = tk.history(period="5d")
+            if hist.empty:
+                return None
+            spot = float(hist["Close"].iloc[-1])
+        name = info.get("shortName") or info.get("longName") or ticker
+        return {"name": name, "spot": spot}
+    except Exception:
+        return None
+
+
 def fetch_option_chain(
     ticker: str,
     target_maturity_days: int = 30,

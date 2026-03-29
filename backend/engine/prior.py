@@ -51,6 +51,14 @@ def bs_prior(sigma_atm: float, T: float, grid: np.ndarray) -> dict:
     # LQD
     psi0 = lqd_from_quantile_derivative(Q_prime)
 
+    # Synthesize an SVI from this flat-vol prior so propagation encoding always
+    # has a valid reference.  Flat vol → a = σ²T, b = 0, rho = 0, m = 0, σ_svi = 0.1
+    svi_a = float(sigma_atm ** 2 * T)
+    svi_params = {
+        "a": svi_a, "b": 0.0, "rho": 0.0, "m": 0.0, "sigma": 0.1,
+        "forward": 100.0, "T": float(T),
+    }
+
     return {
         "psi0": psi0,
         "m": m,
@@ -58,6 +66,7 @@ def bs_prior(sigma_atm: float, T: float, grid: np.ndarray) -> dict:
         "Q_tilde": Q_tilde,
         "Q": Q,
         "Q_prime": Q_prime,
+        "_svi_params": svi_params,
     }
 
 

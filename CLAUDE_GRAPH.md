@@ -5,9 +5,13 @@
 - Properties: W[i,i]=0, W≥0, row sums ≤ 1 (sub-stochastic)
 - Self-trust: α_i = 1 - Σ_j W[i,j]
 - Construction: `build_influence_matrix()` in `backend/engine/graph.py`
-  - Base: `|ρ_ij| · √(ℓ_j/(ℓ_i+ℓ_j))` (correlation × liquidity asymmetry)
-  - Boosts: index constituent (+index_weight), same sector (×1.2)
-  - Row normalisation with alpha_liquid=0.1, alpha_illiquid=0.3
+  - Correlation: sector-based `get_sector_correlation(s1, s2)` from `config.py` (no hardcoded pairwise)
+  - Base: `|ρ_ij| · ℓ_j/(ℓ_i+ℓ_j)` (correlation × liquidity asymmetry, no sqrt for stronger differentiation)
+  - Boosts: index→constituent only (+index_weight×10), same sector (×1.2)
+  - Self-trust: α_i = α_min + (α_max - α_min) × ℓ_i/ℓ_max (continuous, linear in liquidity)
+    - SPY (ℓ=10): α=0.90 (mostly self-trusting, 10% neighbor influence)
+    - Small stock (ℓ=2): α=0.26 (74% pulled by neighbors)
+  - Row normalisation: `W[i,j] = (1-α_i) · W_raw[i,j] / Σ_w W_raw[i,w]`
 
 ## Propagation Matrix P
 - `P = (I - W_UU)⁻¹ W_UO` (eq.33 from the paper)
@@ -35,9 +39,15 @@ g_unobserved = P @ g_observed    # shape: (N_unobs, 5)
 ```
 
 ### Decoding: new_svi = decode(prior_svi, g_propagated)
-- Proportional: `new = prior * (1 + g)`
+- Proportional: `new = prior * (1 + g)` (g capped at ±5x)
 - Absolute: `new = prior + g`
-- Clamp: a≥0, b≥0, ρ∈[-0.999,0.999], σ≥1e-4
+- Clamp to fit_svi bounds: a∈[0,0.15], b∈[0,0.50], ρ∈[-0.999,0.999], m∈[-0.20,0.20], σ∈[1e-4,1.0]
+
+### Known limitation
+Raw SVI params {a,b,ρ,m,σ} are not orthogonal — `a` mixes variance level with shape.
+Proportional encoding on `a` conflates level changes with shape. Next step: SVI-JW
+(Jump-Wing) reparametrisation {v_t, ψ_t, p_t, c_t, ṽ_t} which cleanly separates
+ATM variance level from shape parameters.
 
 ### File: `backend/engine/pipeline.py` → `_svi_encode()`, `_svi_decode()`, Phase A/B/C
 
@@ -54,6 +64,6 @@ g_unobserved = P @ g_observed    # shape: (N_unobs, 5)
 - **`/api/solve`** (full): LQD normal equations + graph propagation + SVI-space encode/propagate/decode. Called ONLY by Propagate button.
 
 ## Planned
+- **SVI-JW propagation**: replace raw SVI encoding with Jump-Wing params for orthogonal level/shape separation
 - Multi-expiry: W shared or per-expiry scaled, convex ordering constraint via QP
 - Cinematics: Neumann series animation (hop-by-hop influence flow)
-- Alternative propagation models (beyond SVI-space)

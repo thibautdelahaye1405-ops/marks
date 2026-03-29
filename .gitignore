@@ -3,3 +3,5 @@ __pycache__/
 node_modules/
 db/*.sqlite
 .env
+selections/
+catalog_custom.json

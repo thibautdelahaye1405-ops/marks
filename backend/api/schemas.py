@@ -144,3 +144,20 @@ class TreasuryCurveResponse(BaseModel):
     date: str
     tenors: List[float]
     rates: List[float]
+
+
+class UniverseSelectRequest(BaseModel):
+    tickers: List[str]
+
+
+class AddTickerRequest(BaseModel):
+    ticker: str
+    name: str = ""
+    sector: str = "Other"
+    is_index: bool = False
+    liquidity_score: float = 2.0
+
+
+class CatalogResponse(BaseModel):
+    assets: List[Asset]
+    active_tickers: List[str]

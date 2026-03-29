@@ -54,13 +54,17 @@ _state = {
 ```
 
 ## Referential
-- File: `backend/config.py` (AssetDef, DEFAULT_UNIVERSE, DEFAULT_CORRELATIONS, EngineConfig)
-- File: `backend/data/referential.py` (get_universe, get_asset_map)
-- Currently: 10 hardcoded assets (SPY + 5 equities + 2 financials + 2 ETFs)
-- Correlation fallback: 0.3 for unknown pairs
+- File: `backend/config.py` (AssetDef, CATALOG, CATALOG_MAP, SECTORS, sector correlation matrix, EngineConfig)
+- File: `backend/data/referential.py` (get_catalog, get_universe, set_active_tickers, add_ticker, save/load_selection)
+- **Catalog**: 101 built-in tickers across 12 sectors + user-added custom tickers
+- **Active universe**: selectable subset of catalog, persisted in `selections/default.json`
+- **Custom tickers**: persisted in `catalog_custom.json`, validated on Yahoo before acceptance
+- **Correlations**: sector-based matrix (`get_sector_correlation(s1, s2)`), no more hardcoded pairwise
+- **Sectors**: Index, Technology, Consumer Disc, Consumer Staples, Financials, Healthcare, Energy, Industrials, Communication, Utilities, Real Estate, Materials
 - `EngineConfig.risk_free_rate`: None = Treasury curve, float = flat override
 - `EngineConfig.repo_rate_gc`: GC repo rate (default 0%)
 - `EngineConfig.repo_overrides`: per-ticker repo rate overrides
+- `EngineConfig.alpha_min/alpha_max`: self-trust range (liquidity-scaled)
 
 ## API Endpoints
 | Endpoint | Method | Purpose |
@@ -83,7 +87,10 @@ _state = {
 | `/api/forward/{ticker}/prior` | PUT | Set/clear forward override (prior) |
 | `/api/rates/treasury` | GET | Current Treasury curve |
 | `/api/rates/config` | GET/PUT | Repo rate config |
+| `/api/catalog` | GET | Full catalog + active tickers |
+| `/api/universe/select` | POST | Set active universe, rebuild W |
+| `/api/universe/add` | POST | Add ticker (Yahoo validated), rebuild W |
+| `/api/universe/save` | POST | Persist current selection to disk |
 
 ## Planned
 - Multi-source: per-ticker source selection for spot/options/dividends
-- Expanded universe: ~100 S&P names with sector-based correlation defaults

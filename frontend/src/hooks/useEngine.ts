@@ -4,11 +4,14 @@ import type {
   QuoteSnapshot,
   SolveResponse,
   GraphData,
+  CatalogResponse,
 } from "../types";
 import { api } from "../api/client";
 
 interface EngineState {
   // Data
+  catalog: Asset[];
+  activeTickers: string[];
   universe: Asset[];
   quotes: Record<string, QuoteSnapshot>;
   solveResult: SolveResponse | null;
@@ -36,8 +39,15 @@ interface EngineState {
   priorsCalibrated: boolean;
   priorsVersion: number;  // incremented when priors change, forces Prior tab refresh
 
+  // Universe dirty flag (unsaved selection changes)
+  universeUnsaved: boolean;
+
   // Actions
+  fetchCatalog: () => Promise<void>;
   fetchUniverse: () => Promise<void>;
+  selectUniverse: (tickers: string[]) => Promise<void>;
+  saveSelection: () => Promise<void>;
+  addTicker: (ticker: string, name?: string, sector?: string) => Promise<void>;
   fetchPriors: () => Promise<void>;
   fetchSnapshot: () => Promise<void>;
   fit: () => Promise<void>;       // lightweight: SVI for observed, prior for unobserved
@@ -65,6 +75,8 @@ interface EngineState {
 let _propagateSeq = 0;
 
 export const useEngine = create<EngineState>((set, get) => ({
+  catalog: [],
+  activeTickers: [],
   universe: [],
   quotes: {},
   solveResult: null,
@@ -83,6 +95,16 @@ export const useEngine = create<EngineState>((set, get) => ({
   addedPriorQuotes: {},
   priorsCalibrated: false,
   priorsVersion: 0,
+  universeUnsaved: false,
+
+  fetchCatalog: async () => {
+    try {
+      const resp = await api.getCatalog();
+      set({ catalog: resp.assets, activeTickers: resp.active_tickers });
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
 
   fetchUniverse: async () => {
     try {
@@ -90,6 +112,64 @@ export const useEngine = create<EngineState>((set, get) => ({
       set({ universe });
     } catch (e: any) {
       set({ error: e.message });
+    }
+  },
+
+  selectUniverse: async (tickers: string[]) => {
+    set({ loading: true, error: null });
+    try {
+      const resp = await api.selectUniverse(tickers);
+      set({
+        activeTickers: resp.tickers,
+        universe: resp.graph.assets,
+        graphData: resp.graph,
+        universeUnsaved: true,
+        // Clear stale state
+        quotes: {},
+        solveResult: null,
+        observedTickers: [],
+        excludedQuotes: {},
+        addedQuotes: {},
+        excludedPriorQuotes: {},
+        addedPriorQuotes: {},
+        priorsCalibrated: false,
+        selectedNode: null,
+        loading: false,
+      });
+    } catch (e: any) {
+      set({ error: e.message, loading: false });
+    }
+  },
+
+  saveSelection: async () => {
+    try {
+      await api.saveUniverseSelection();
+      set({ universeUnsaved: false });
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
+
+  addTicker: async (ticker: string, name?: string, sector?: string) => {
+    set({ loading: true, error: null });
+    try {
+      const resp = await api.addTicker(ticker, name, sector);
+      // Add to catalog if not present, mark as active
+      set((s) => {
+        const inCatalog = s.catalog.some((a) => a.ticker === resp.asset.ticker);
+        return {
+          catalog: inCatalog ? s.catalog : [...s.catalog, resp.asset],
+          activeTickers: resp.tickers,
+          universeUnsaved: true,
+          loading: false,
+        };
+      });
+      // Refresh universe + graph
+      await get().fetchUniverse();
+      await get().fetchGraph();
+    } catch (e: any) {
+      set({ error: e.message, loading: false });
+      throw e;  // re-throw so the UI can catch and display
     }
   },
 

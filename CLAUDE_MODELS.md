@@ -34,6 +34,13 @@
 - Known issue: columns nearly collinear in IV space → large cancelling betas
 - Role: only for the normal equations solve (which feeds the propagation matrix P)
 
+## SVI-JW Reparametrisation (next for propagation)
+- Jump-Wing form: `{v_t, ψ_t, p_t, c_t, ṽ_t}` — ATM variance, ATM skew, put slope, call slope, min variance
+- Clean level/shape separation: v_t is the level, (ψ_t, p_t, c_t) are dimensionless shape params
+- Conversion: raw SVI ↔ JW is bijective (Gatheral 2004, Section 3.3)
+- Propagation: v_t proportional, all shape params absolute — no conflation
+- `ṽ_t` (min variance) constrained ≥ 0 for butterfly-free condition
+
 ## Planned Models
 - **Extended SVI (eSSVI/SSVI)**: inter-expiry consistency, calendar arbitrage free
 - **Polynomial of Sigmoids**: `σ(k) = Σ wᵢ·sigmoid(aᵢk+bᵢ) + c`, flexible, needs butterfly constraint

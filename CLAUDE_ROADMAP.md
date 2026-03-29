@@ -31,11 +31,14 @@
 
 ## 2. Referential & Connectors
 
-### 2.1 Selectable universe ⭐ NEXT
-- Expand `config.py` to ~100 liquid names (S&P constituents + major ETFs)
-- Multi-select UI in Referential panel (currently stubbed)
-- Sector-based correlation defaults (intra ~0.6-0.8, cross ~0.3-0.5)
-- Text input to add arbitrary tickers to the universe
+### 2.1 Selectable universe ✅ DONE
+- 101 tickers across 12 GICS-aligned sectors in `config.py` CATALOG
+- Searchable multi-select UI in Referential panel, grouped by sector with collapse/expand
+- Sector-based correlation matrix (replaces hardcoded pairwise correlations): intra ~0.60-0.80, cross ~0.20-0.50
+- Text input to add arbitrary tickers — validates on Yahoo Finance before accepting
+- Persistence: `selections/default.json` for active universe, `catalog_custom.json` for user-added tickers
+- Save button with dirty-flag tracking; auto-loads previous selection on restart
+- W matrix rebuilt automatically on universe change
 
 ### 2.2 Multi-source architecture
 - Per-ticker source selection for: spot price, options chain, dividends
@@ -85,10 +88,20 @@
 
 ## 4. Propagation
 
-### 4.1 Current: SVI-space propagation ✅ DONE
+### 4.1 Current: raw SVI-space propagation ✅ DONE (with known limitations)
 - Encode: proportional for (a, b, σ), absolute for (ρ, m)
 - Propagate: P = (I - W_UU)⁻¹ W_UO applied to 5-vectors
 - Decode: apply to each unobserved prior SVI
+- Safeguards: proportional ratio capped at ±5x, decoded params clamped to fit_svi bounds
+- **Limitation**: raw SVI params are not orthogonal — level/shape not separated, params not normalised. Proportional encoding on `a` (total variance level) conflates variance level changes with shape changes.
+
+### 4.1b SVI-JW normalised propagation ⭐ NEXT
+- Replace raw SVI {a,b,ρ,m,σ} propagation with SVI-JW (Jump-Wing) parametrisation
+- JW params {v_t, ψ_t, p_t, c_t, ṽ_t}: ATM variance, ATM skew, put slope, call slope, min variance
+- Better separation: v_t controls level, (ψ_t, p_t, c_t) control shape orthogonally
+- Naturally normalised — all params are either variance-like or dimensionless slopes
+- v_t propagated proportionally, shape params propagated absolutely
+- Reference: Gatheral (2004) SVI-JW reparametrisation
 
 ### 4.2 Butterfly arbitrage safeguard
 - After propagation, check density non-negativity: `d²C/dK² ≥ 0`
@@ -111,9 +124,11 @@
 
 ## 5. Influence Matrix
 
-### 5.1 New asset defaults
-- When adding an asset to observed set, default W weights = 0 (conservative)
-- Sector-based template: auto-populate from sector average weights as suggestion
+### 5.1 New asset defaults ✅ DONE
+- Sector-based correlation matrix drives W weights automatically for any universe size
+- Self-trust α scales continuously with liquidity: α_min=0.10 (illiquid) to α_max=0.90 (most liquid)
+- Liquidity asymmetry: `W[i,j] ∝ ℓ_j/(ℓ_i+ℓ_j)` (no sqrt — stronger differentiation)
+- Index→constituent boost (one-directional); same-sector ×1.2 affinity
 
 ### 5.2 Matrix editing improvements
 - Worksheet-like copy-paste (bulk edit rows/columns)

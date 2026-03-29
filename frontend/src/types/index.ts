@@ -96,3 +96,20 @@ export interface TreasuryCurveData {
   tenors: number[];
   rates: number[];
 }
+
+export interface CatalogResponse {
+  assets: Asset[];
+  active_tickers: string[];
+}
+
+export interface UniverseSelectResponse {
+  status: string;
+  tickers: string[];
+  graph: GraphData;
+}
+
+export interface AddTickerResponse {
+  status: string;
+  asset: Asset;
+  tickers: string[];
+}

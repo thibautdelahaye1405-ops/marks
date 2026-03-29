@@ -8,7 +8,7 @@
 
 ## Layout
 - **Top bar**: Fetch Priors (modal), Fetch Snapshot, Modelling (slide-out), Referential (slide-out), status
-- **Left sidebar** (160px): Propagate button, asset list with All/None + checkboxes
+- **Left sidebar** (160px): Propagate button, active universe asset list with All/None + checkboxes
 - **Main area**: Graph | W Matrix | All Smiles toggle
 - **Detail panel** (appears on node selection, graph shrinks to 280px): Smile | Prior | Propagation tabs
 

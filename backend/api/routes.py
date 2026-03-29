@@ -11,6 +11,7 @@ from .schemas import (
     DistributionView, PriorOverrideRequest, BetaOverrideRequest,
     NodeDistributionResponse, PriorRefitRequest,
     SavedPriorInfo, SavePriorRequest, SviOverrideRequest, FitRequest,
+    UniverseSelectRequest, AddTickerRequest, CatalogResponse,
 )
 from ..data.prior_store import (
     list_saved_priors as _list_saved_priors,
@@ -18,8 +19,12 @@ from ..data.prior_store import (
     load_prior as _load_prior,
 )
 from ..config import EngineConfig, DEFAULT_UNIVERSE
-from ..data.referential import get_universe
-from ..data.quotes import fetch_option_chain, OptionChainData
+from ..data.referential import (
+    get_universe, get_catalog, get_active_tickers,
+    set_active_tickers, add_ticker as _add_ticker,
+    confirm_ticker, save_selection,
+)
+from ..data.quotes import fetch_option_chain, OptionChainData, validate_ticker
 from ..data.store import save_snapshot, get_latest_snapshots
 from ..engine.lqd import quantile_grid, basis_functions
 from ..engine.prior import bs_prior, fit_lqd_prior, apply_beta_overrides, compute_distribution_view
@@ -134,6 +139,109 @@ def get_universe_endpoint():
     ]
 
 
+@router.get("/catalog", response_model=CatalogResponse)
+def get_catalog_endpoint():
+    """Return the full asset catalog and currently active tickers."""
+    catalog = get_catalog()
+    return CatalogResponse(
+        assets=[
+            Asset(
+                ticker=a.ticker, name=a.name, sector=a.sector,
+                is_index=a.is_index, index_weight=a.index_weight,
+                liquidity_score=a.liquidity_score,
+            )
+            for a in catalog
+        ],
+        active_tickers=get_active_tickers(),
+    )
+
+
+@router.post("/universe/select")
+def select_universe(req: UniverseSelectRequest):
+    """
+    Set the active universe to the given tickers.
+    Rebuilds the influence matrix W for the new universe.
+    """
+    universe = set_active_tickers(req.tickers)
+    # Rebuild W for new universe
+    W, alphas = build_influence_matrix(universe)
+    _state["W"] = W
+    _state["alphas"] = alphas
+    # Clear stale quotes for tickers no longer in universe
+    active = set(t.ticker for t in universe)
+    _state["quotes"] = {t: c for t, c in _state["quotes"].items() if t in active}
+    tickers = [a.ticker for a in universe]
+    return {
+        "status": "ok",
+        "tickers": tickers,
+        "graph": GraphData(
+            tickers=tickers,
+            W=W.tolist(),
+            alphas=alphas.tolist(),
+            assets=[
+                Asset(
+                    ticker=a.ticker, name=a.name, sector=a.sector,
+                    is_index=a.is_index, index_weight=a.index_weight,
+                    liquidity_score=a.liquidity_score,
+                )
+                for a in universe
+            ],
+        ),
+    }
+
+
+@router.post("/universe/add")
+def add_ticker_endpoint(req: AddTickerRequest):
+    """
+    Add an arbitrary ticker to the catalog and active universe.
+    Validates against Yahoo Finance first — rejects if not found.
+    Rebuilds the influence matrix W on success.
+    """
+    ticker = req.ticker.upper().strip()
+
+    # Already in catalog — just add to active set
+    from ..config import CATALOG_MAP
+    if ticker in CATALOG_MAP:
+        asset = _add_ticker(ticker=ticker)
+    else:
+        # Validate on Yahoo Finance before committing
+        yahoo = validate_ticker(ticker)
+        if yahoo is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Ticker '{ticker}' not found on Yahoo Finance",
+            )
+        name = req.name or yahoo["name"]
+        asset = _add_ticker(
+            ticker=ticker, name=name, sector=req.sector,
+            is_index=req.is_index, liquidity_score=req.liquidity_score,
+        )
+
+    # Rebuild W with updated universe
+    universe = get_universe()
+    W, alphas = build_influence_matrix(universe)
+    _state["W"] = W
+    _state["alphas"] = alphas
+    tickers = [a.ticker for a in universe]
+    return {
+        "status": "ok",
+        "asset": Asset(
+            ticker=asset.ticker, name=asset.name, sector=asset.sector,
+            is_index=asset.is_index, index_weight=asset.index_weight,
+            liquidity_score=asset.liquidity_score,
+        ),
+        "tickers": tickers,
+    }
+
+
+@router.post("/universe/save")
+def save_universe_selection():
+    """Persist the current active universe selection to disk."""
+    tickers = get_active_tickers()
+    save_selection(tickers)
+    return {"status": "ok", "tickers": tickers}
+
+
 @router.post("/fetch-quotes", response_model=Dict[str, QuoteSnapshot])
 def fetch_quotes_endpoint():
     """Fetch fresh option chains from Yahoo Finance for the entire universe."""
@@ -165,6 +273,7 @@ def fetch_quotes_endpoint():
             _state["quotes"][asset.ticker] = chain
             save_snapshot(chain)
             results[asset.ticker] = _chain_to_snapshot(chain)
+            confirm_ticker(asset.ticker)
 
     if not results:
         raise HTTPException(status_code=503, detail="Could not fetch any quotes")

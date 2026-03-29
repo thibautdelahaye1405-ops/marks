@@ -1,8 +1,17 @@
 export const SECTOR_COLORS: Record<string, string> = {
   Index: "#6366f1",
   Technology: "#06b6d4",
-  Consumer: "#f59e0b",
+  "Consumer Disc": "#f59e0b",
+  "Consumer Staples": "#d97706",
   Financials: "#10b981",
+  Healthcare: "#ec4899",
+  Energy: "#ef4444",
+  Industrials: "#8b5cf6",
+  Communication: "#14b8a6",
+  Utilities: "#64748b",
+  "Real Estate": "#a78bfa",
+  Materials: "#f97316",
+  Other: "#94a3b8",
 };
 
 export function sectorColor(sector: string): string {
