@@ -13,6 +13,8 @@ import type {
   UniverseSelectResponse,
   AddTickerResponse,
   AvailableExpiries,
+  ConfigSnapshotInfo,
+  ConfigSnapshotFull,
 } from "../types";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -218,5 +220,48 @@ export const api = {
   getTimeKernel: (lambdaT?: number) =>
     request<{ K: number[][]; expiries: string[]; T_values: number[]; labels: string[]; lambda_T: number }>(
       "/time-kernel" + (lambdaT != null ? `?lambda_T=${lambdaT}` : "")
+    ),
+
+  // Phase 4: Config snapshots & sparsification
+
+  saveConfigSnapshot: (req: {
+    label: string;
+    lambda_T?: number;
+    alpha_time?: number;
+    lambda_?: number;
+    eta?: number;
+    lambda_prior?: number;
+    smile_model?: string;
+    alpha_overrides?: Record<string, number>;
+  }) =>
+    request<{ status: string; id: number }>("/config-snapshot", {
+      method: "POST",
+      body: JSON.stringify(req),
+    }),
+
+  listConfigSnapshots: () =>
+    request<ConfigSnapshotInfo[]>("/config-snapshots"),
+
+  loadConfigSnapshot: (id: number) =>
+    request<ConfigSnapshotFull>(`/config-snapshot/${id}`),
+
+  deleteConfigSnapshot: (id: number) =>
+    request<{ status: string }>(`/config-snapshot/${id}`, { method: "DELETE" }),
+
+  applyConfigSnapshot: (id: number) =>
+    request<ConfigSnapshotFull & { status: string }>(`/config-snapshot/${id}/apply`, {
+      method: "POST",
+    }),
+
+  sparsifyW: (threshold: number) =>
+    request<{ status: string; zeroed_count: number; W: number[][]; alphas: number[] }>(
+      "/sparsify-w",
+      { method: "POST", body: JSON.stringify({ threshold }) },
+    ),
+
+  resetW: () =>
+    request<{ status: string; W: number[][]; alphas: number[]; tickers: string[] }>(
+      "/reset-w",
+      { method: "POST" },
     ),
 };

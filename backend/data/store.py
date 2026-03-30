@@ -46,6 +46,22 @@ def init_db():
             alphas TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS config_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            label TEXT NOT NULL,
+            tickers TEXT NOT NULL,
+            matrix TEXT NOT NULL,
+            alphas TEXT NOT NULL,
+            alpha_overrides TEXT NOT NULL DEFAULT '{}',
+            lambda_T REAL NOT NULL DEFAULT 2.0,
+            alpha_time REAL NOT NULL DEFAULT 0.5,
+            lambda_ REAL NOT NULL DEFAULT 0.0,
+            eta REAL NOT NULL DEFAULT 0.01,
+            lambda_prior REAL NOT NULL DEFAULT 0.10,
+            smile_model TEXT NOT NULL DEFAULT 'svi'
+        );
+
         CREATE INDEX IF NOT EXISTS idx_snap_ticker ON snapshots(ticker, timestamp);
         CREATE INDEX IF NOT EXISTS idx_snap_ticker_expiry ON snapshots(ticker, expiry, timestamp);
     """)
@@ -140,6 +156,106 @@ def save_w_matrix(tickers: List[str], W: np.ndarray, alphas: np.ndarray) -> int:
     w_id = cur.lastrowid
     conn.close()
     return w_id
+
+
+# ---------------------------------------------------------------------------
+# Config snapshot persistence (Phase 4)
+# ---------------------------------------------------------------------------
+
+def save_config_snapshot(
+    label: str,
+    tickers: List[str],
+    W: np.ndarray,
+    alphas: np.ndarray,
+    alpha_overrides: Dict[str, float],
+    lambda_T: float,
+    alpha_time: float,
+    lambda_: float,
+    eta: float,
+    lambda_prior: float,
+    smile_model: str,
+) -> int:
+    """Save a complete config snapshot (W + hyperparameters)."""
+    conn = _get_conn()
+    cur = conn.execute(
+        """INSERT INTO config_snapshots
+           (timestamp, label, tickers, matrix, alphas,
+            alpha_overrides, lambda_T, alpha_time,
+            lambda_, eta, lambda_prior, smile_model)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            datetime.now().isoformat(),
+            label,
+            json.dumps(tickers),
+            json.dumps(W.tolist()),
+            json.dumps(alphas.tolist()),
+            json.dumps(alpha_overrides),
+            lambda_T,
+            alpha_time,
+            lambda_,
+            eta,
+            lambda_prior,
+            smile_model,
+        ),
+    )
+    conn.commit()
+    snap_id = cur.lastrowid
+    conn.close()
+    return snap_id
+
+
+def list_config_snapshots() -> List[dict]:
+    """List all saved config snapshots (metadata only, no matrix data)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT id, timestamp, label, tickers, lambda_T, smile_model FROM config_snapshots ORDER BY timestamp DESC"
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "label": r["label"],
+            "tickers": json.loads(r["tickers"]),
+            "lambda_T": r["lambda_T"],
+            "smile_model": r["smile_model"],
+        }
+        for r in rows
+    ]
+
+
+def load_config_snapshot(snap_id: int) -> Optional[dict]:
+    """Load a full config snapshot by ID."""
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM config_snapshots WHERE id=?", (snap_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "timestamp": row["timestamp"],
+        "label": row["label"],
+        "tickers": json.loads(row["tickers"]),
+        "W": np.array(json.loads(row["matrix"])),
+        "alphas": np.array(json.loads(row["alphas"])),
+        "alpha_overrides": json.loads(row["alpha_overrides"]),
+        "lambda_T": row["lambda_T"],
+        "alpha_time": row["alpha_time"],
+        "lambda_": row["lambda_"],
+        "eta": row["eta"],
+        "lambda_prior": row["lambda_prior"],
+        "smile_model": row["smile_model"],
+    }
+
+
+def delete_config_snapshot(snap_id: int) -> bool:
+    """Delete a config snapshot by ID. Returns True if found and deleted."""
+    conn = _get_conn()
+    cur = conn.execute("DELETE FROM config_snapshots WHERE id=?", (snap_id,))
+    conn.commit()
+    deleted = cur.rowcount > 0
+    conn.close()
+    return deleted
 
 
 # Initialise on import

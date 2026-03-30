@@ -129,3 +129,30 @@ export interface AvailableExpiries {
 export interface ExpirySelection {
   selections: Record<string, string[]>;
 }
+
+// Phase 4: Config snapshots
+
+export interface ConfigSnapshotInfo {
+  id: number;
+  timestamp: string;
+  label: string;
+  tickers: string[];
+  lambda_T: number;
+  smile_model: string;
+}
+
+export interface ConfigSnapshotFull {
+  id: number;
+  timestamp: string;
+  label: string;
+  tickers: string[];
+  W: number[][];
+  alphas: number[];
+  alpha_overrides: Record<string, number>;
+  lambda_T: number;
+  alpha_time: number;
+  lambda_: number;
+  eta: number;
+  lambda_prior: number;
+  smile_model: string;
+}

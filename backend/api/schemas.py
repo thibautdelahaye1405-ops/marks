@@ -180,3 +180,45 @@ class AvailableExpiriesResponse(BaseModel):
 
 class ExpirySelectionRequest(BaseModel):
     selections: Dict[str, List[str]]  # ticker -> list of expiry dates
+
+
+# Phase 4: Config snapshots & sparsification
+
+class SaveConfigSnapshotRequest(BaseModel):
+    label: str
+    lambda_T: float = 2.0
+    alpha_time: float = 0.5
+    lambda_: float = 0.0
+    eta: float = 0.01
+    lambda_prior: float = 0.10
+    smile_model: str = "svi"
+    alpha_overrides: Dict[str, float] = {}
+
+
+class ConfigSnapshotInfo(BaseModel):
+    id: int
+    timestamp: str
+    label: str
+    tickers: List[str]
+    lambda_T: float
+    smile_model: str
+
+
+class ConfigSnapshotFull(BaseModel):
+    id: int
+    timestamp: str
+    label: str
+    tickers: List[str]
+    W: List[List[float]]
+    alphas: List[float]
+    alpha_overrides: Dict[str, float]
+    lambda_T: float
+    alpha_time: float
+    lambda_: float
+    eta: float
+    lambda_prior: float
+    smile_model: str
+
+
+class SparsifyRequest(BaseModel):
+    threshold: float = 0.01  # zero out entries below this

@@ -5,6 +5,8 @@ import type {
   SolveResponse,
   GraphData,
   CatalogResponse,
+  ConfigSnapshotInfo,
+  ConfigSnapshotFull,
 } from "../types";
 import { api } from "../api/client";
 
@@ -58,6 +60,15 @@ interface EngineState {
   setLambdaT: (v: number) => void;
   fetchExpiries: (ticker: string) => Promise<void>;
   setExpirySelection: (ticker: string, expiries: string[]) => void;
+
+  // Config snapshots (Phase 4)
+  configSnapshots: ConfigSnapshotInfo[];
+  fetchConfigSnapshots: () => Promise<void>;
+  saveConfigSnapshot: (label: string) => Promise<void>;
+  applyConfigSnapshot: (id: number) => Promise<void>;
+  deleteConfigSnapshot: (id: number) => Promise<void>;
+  sparsifyW: (threshold: number) => Promise<void>;
+  resetW: () => Promise<void>;
 
   // Actions
   fetchCatalog: () => Promise<void>;
@@ -137,6 +148,7 @@ export const useEngine = create<EngineState>((set, get) => ({
   selectedExpiries: {},
   availableExpiries: {},
   lambdaT: 2.0,
+  configSnapshots: [],
 
   fetchCatalog: async () => {
     try {
@@ -614,5 +626,88 @@ export const useEngine = create<EngineState>((set, get) => ({
       const { [ticker]: _, ...rest } = s.addedPriorQuotes;
       return { addedPriorQuotes: rest };
     });
+  },
+
+  // Phase 4: Config snapshots & sparsification
+
+  fetchConfigSnapshots: async () => {
+    try {
+      const snapshots = await api.listConfigSnapshots();
+      set({ configSnapshots: snapshots });
+    } catch {
+      // silently ignore
+    }
+  },
+
+  saveConfigSnapshot: async (label: string) => {
+    const { lambdaT, lambda: lambda_, eta, lambdaPrior, smileModel, alphaOverrides } = get();
+    try {
+      await api.saveConfigSnapshot({
+        label,
+        lambda_T: lambdaT,
+        lambda_: lambda_,
+        eta,
+        lambda_prior: lambdaPrior,
+        smile_model: smileModel,
+        alpha_overrides: alphaOverrides,
+      });
+      await get().fetchConfigSnapshots();
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
+
+  applyConfigSnapshot: async (id: number) => {
+    try {
+      const snap = await api.applyConfigSnapshot(id);
+      set({
+        graphData: get().graphData
+          ? { ...get().graphData!, W: snap.W, alphas: snap.alphas }
+          : null,
+        alphaOverrides: snap.alpha_overrides,
+        lambdaT: snap.lambda_T,
+        lambda: snap.lambda_,
+        eta: snap.eta,
+        lambdaPrior: snap.lambda_prior,
+        smileModel: snap.smile_model,
+      });
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
+
+  deleteConfigSnapshot: async (id: number) => {
+    try {
+      await api.deleteConfigSnapshot(id);
+      await get().fetchConfigSnapshots();
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
+
+  sparsifyW: async (threshold: number) => {
+    try {
+      const result = await api.sparsifyW(threshold);
+      set((s) => ({
+        graphData: s.graphData
+          ? { ...s.graphData, W: result.W, alphas: result.alphas }
+          : null,
+      }));
+    } catch (e: any) {
+      set({ error: e.message });
+    }
+  },
+
+  resetW: async () => {
+    try {
+      const result = await api.resetW();
+      set((s) => ({
+        graphData: s.graphData
+          ? { ...s.graphData, W: result.W, alphas: result.alphas, tickers: result.tickers }
+          : null,
+      }));
+    } catch (e: any) {
+      set({ error: e.message });
+    }
   },
 }));

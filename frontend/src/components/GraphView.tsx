@@ -1,8 +1,9 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import cytoscape from "cytoscape";
 import type { GraphData, SolveResponse } from "../types";
 import { observedColor, inferredColor, weightToOpacity, weightToWidth } from "../utils/colors";
 import { isCompoundKey, splitNodeKey, expiryLabel } from "../utils/nodeKey";
+import PropagationAnimation from "./PropagationAnimation";
 
 interface Props {
   graphData: GraphData | null;
@@ -89,6 +90,8 @@ export default function GraphView({
   const onSelectRef = useRef(onSelectNode);
   selectedRef.current = selectedNode;
   onSelectRef.current = onSelectNode;
+
+  const [animActive, setAnimActive] = useState(false);
 
   // Rebuild graph only when graphData (W matrix) changes
   useEffect(() => {
@@ -307,6 +310,16 @@ export default function GraphView({
     return () => observer.disconnect();
   }, []);
 
+  // Build nodeObserved map for animation
+  const nodeObserved: Record<string, boolean> = {};
+  if (solveResult && graphData) {
+    for (const t of graphData.tickers) {
+      nodeObserved[t] = solveResult.nodes[t]?.is_observed ?? false;
+    }
+  }
+
+  const hasNeumann = !!(solveResult?.neumann_terms && solveResult.neumann_terms.length > 0);
+
   return (
     <div style={{ width: "100%", height: "100%", position: "relative" }}>
       <div
@@ -318,12 +331,25 @@ export default function GraphView({
           borderRadius: 8,
         }}
       />
-      {/* Legend */}
+
+      {/* Animation overlay */}
+      <PropagationAnimation
+        cy={cyRef.current}
+        W={graphData?.W ?? []}
+        tickers={graphData?.tickers ?? []}
+        neumannTerms={solveResult?.neumann_terms ?? null}
+        nodeObserved={nodeObserved}
+        active={animActive}
+        onClose={() => setAnimActive(false)}
+      />
+
+      {/* Legend + animate button */}
       <div
         style={{
           position: "absolute",
           bottom: 12,
           left: 12,
+          right: 12,
           background: "rgba(15,23,42,0.85)",
           borderRadius: 6,
           padding: "8px 12px",
@@ -331,6 +357,7 @@ export default function GraphView({
           color: "#94a3b8",
           display: "flex",
           gap: 16,
+          alignItems: "center",
         }}
       >
         <span>
@@ -344,7 +371,28 @@ export default function GraphView({
         <span style={{ color: "#475569" }}>
           Top = most influential | Hover for W coefficients
         </span>
+        <div style={{ flex: 1 }} />
+        {hasNeumann && !animActive && (
+          <button
+            onClick={() => setAnimActive(true)}
+            style={animBtnStyle}
+            title="Animate propagation hop by hop"
+          >
+            Animate Propagation
+          </button>
+        )}
       </div>
     </div>
   );
 }
+
+const animBtnStyle: React.CSSProperties = {
+  padding: "4px 10px",
+  fontSize: 10,
+  fontWeight: 600,
+  background: "#6366f1",
+  color: "#fff",
+  border: "none",
+  borderRadius: 4,
+  cursor: "pointer",
+};

@@ -3,7 +3,7 @@ FastAPI routes for the vol marking application.
 """
 import numpy as np
 from fastapi import APIRouter, HTTPException
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from .schemas import (
     Asset, QuoteSnapshot, SolveRequest, SolveResponse,
@@ -13,6 +13,8 @@ from .schemas import (
     SavedPriorInfo, SavePriorRequest, SviOverrideRequest, FitRequest,
     UniverseSelectRequest, AddTickerRequest, CatalogResponse,
     AvailableExpiriesResponse, ExpirySelectionRequest,
+    SaveConfigSnapshotRequest, ConfigSnapshotInfo, ConfigSnapshotFull,
+    SparsifyRequest,
 )
 from ..data.prior_store import (
     list_saved_priors as _list_saved_priors,
@@ -26,7 +28,10 @@ from ..data.referential import (
     confirm_ticker, save_selection,
 )
 from ..data.quotes import fetch_option_chain, fetch_available_expiries, fetch_option_chains, OptionChainData, validate_ticker
-from ..data.store import save_snapshot, get_latest_snapshots
+from ..data.store import (
+    save_snapshot, get_latest_snapshots,
+    save_config_snapshot, list_config_snapshots, load_config_snapshot, delete_config_snapshot,
+)
 from ..utils.node_key import make_node_key, split_node_key, is_compound_key, ticker_of, group_by_ticker, unique_tickers
 from ..engine.lqd import quantile_grid, basis_functions
 from ..engine.prior import bs_prior, fit_lqd_prior, apply_beta_overrides, compute_distribution_view
@@ -1778,3 +1783,140 @@ def set_prior_forward_override(ticker: str, req: dict):
         _state["prev_forward_overrides"][ticker] = float(fwd_val)
 
     return {"status": "ok", "ticker": ticker}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Config Snapshots & Sparsification
+# ---------------------------------------------------------------------------
+
+@router.post("/config-snapshot")
+def save_config_snapshot_endpoint(req: SaveConfigSnapshotRequest):
+    """Save the current W matrix + hyperparameters as a named config snapshot."""
+    if _state["W"] is None:
+        raise HTTPException(status_code=400, detail="No W matrix to save. Build graph first.")
+
+    universe = get_universe()
+    all_quote_keys = list(_state.get("quotes", {}).keys())
+    multi_expiry = any(is_compound_key(k) for k in all_quote_keys)
+    tickers = all_quote_keys if multi_expiry else [a.ticker for a in universe]
+
+    snap_id = save_config_snapshot(
+        label=req.label,
+        tickers=tickers,
+        W=_state["W"],
+        alphas=_state["alphas"],
+        alpha_overrides=req.alpha_overrides,
+        lambda_T=req.lambda_T,
+        alpha_time=req.alpha_time,
+        lambda_=req.lambda_,
+        eta=req.eta,
+        lambda_prior=req.lambda_prior,
+        smile_model=req.smile_model,
+    )
+    return {"status": "ok", "id": snap_id}
+
+
+@router.get("/config-snapshots", response_model=List[ConfigSnapshotInfo])
+def list_config_snapshots_endpoint():
+    """List all saved config snapshots (metadata only)."""
+    return list_config_snapshots()
+
+
+@router.get("/config-snapshot/{snap_id}", response_model=ConfigSnapshotFull)
+def load_config_snapshot_endpoint(snap_id: int):
+    """Load a full config snapshot by ID."""
+    snap = load_config_snapshot(snap_id)
+    if snap is None:
+        raise HTTPException(status_code=404, detail=f"Config snapshot {snap_id} not found")
+    return ConfigSnapshotFull(
+        id=snap["id"],
+        timestamp=snap["timestamp"],
+        label=snap["label"],
+        tickers=snap["tickers"],
+        W=snap["W"].tolist(),
+        alphas=snap["alphas"].tolist(),
+        alpha_overrides=snap["alpha_overrides"],
+        lambda_T=snap["lambda_T"],
+        alpha_time=snap["alpha_time"],
+        lambda_=snap["lambda_"],
+        eta=snap["eta"],
+        lambda_prior=snap["lambda_prior"],
+        smile_model=snap["smile_model"],
+    )
+
+
+@router.delete("/config-snapshot/{snap_id}")
+def delete_config_snapshot_endpoint(snap_id: int):
+    """Delete a config snapshot."""
+    deleted = delete_config_snapshot(snap_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Config snapshot {snap_id} not found")
+    return {"status": "ok"}
+
+
+@router.post("/config-snapshot/{snap_id}/apply")
+def apply_config_snapshot_endpoint(snap_id: int):
+    """Load a config snapshot and apply it to the current session state."""
+    snap = load_config_snapshot(snap_id)
+    if snap is None:
+        raise HTTPException(status_code=404, detail=f"Config snapshot {snap_id} not found")
+
+    _state["W"] = snap["W"]
+    _state["alphas"] = snap["alphas"]
+
+    return {
+        "status": "ok",
+        "tickers": snap["tickers"],
+        "W": snap["W"].tolist(),
+        "alphas": snap["alphas"].tolist(),
+        "alpha_overrides": snap["alpha_overrides"],
+        "lambda_T": snap["lambda_T"],
+        "alpha_time": snap["alpha_time"],
+        "lambda_": snap["lambda_"],
+        "eta": snap["eta"],
+        "lambda_prior": snap["lambda_prior"],
+        "smile_model": snap["smile_model"],
+    }
+
+
+@router.post("/sparsify-w")
+def sparsify_w_endpoint(req: SparsifyRequest):
+    """Zero out W entries below threshold. Alpha absorbs the slack."""
+    if _state["W"] is None:
+        raise HTTPException(status_code=400, detail="No W matrix. Build graph first.")
+
+    W = _state["W"].copy()
+    mask = W < req.threshold
+    np.fill_diagonal(mask, False)  # don't touch diagonal (already 0)
+    W[mask] = 0.0
+
+    # Alpha absorbs the slack: alphas = 1 - row_sums
+    alphas = 1.0 - W.sum(axis=1)
+    alphas = np.clip(alphas, 0.01, 0.99)
+
+    _state["W"] = W
+    _state["alphas"] = alphas
+
+    zeroed = int(mask.sum())
+    return {
+        "status": "ok",
+        "zeroed_count": zeroed,
+        "W": W.tolist(),
+        "alphas": alphas.tolist(),
+    }
+
+
+@router.post("/reset-w")
+def reset_w_endpoint():
+    """Reset W matrix to auto-generated from asset correlations + liquidity."""
+    universe = get_universe()
+    W, alphas = build_influence_matrix(universe)
+    _state["W"] = W
+    _state["alphas"] = alphas
+
+    return {
+        "status": "ok",
+        "W": W.tolist(),
+        "alphas": alphas.tolist(),
+        "tickers": [a.ticker for a in universe],
+    }
