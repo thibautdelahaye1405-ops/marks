@@ -189,3 +189,117 @@ def neumann_series_terms(W_UU: np.ndarray, W_UO: np.ndarray,
         W_power = W_power @ W_UU
 
     return terms
+
+
+# ---------------------------------------------------------------------------
+# Multi-expiry: time kernel and Kronecker product tensor
+# ---------------------------------------------------------------------------
+
+def build_time_kernel(T_values: np.ndarray, lambda_T: float) -> np.ndarray:
+    """Build the cross-maturity influence kernel.
+
+    K[i,j] = exp(-lambda_T * |sqrt(T_i) - sqrt(T_j)|)
+
+    The kernel is row-normalized to be sub-stochastic (like W_asset):
+    K[i,j] /= sum_j K[i,j], then scaled so diagonal = 0 and row sums ≤ 1.
+
+    Args:
+        T_values: maturities in years, shape (M,)
+        lambda_T: decay speed (higher = less cross-maturity influence)
+
+    Returns:
+        K: (M, M) row-normalized time kernel
+    """
+    T_values = np.asarray(T_values, dtype=float)
+    M = len(T_values)
+    if M <= 1:
+        return np.array([[1.0]])
+
+    sqrt_T = np.sqrt(np.maximum(T_values, 1e-8))
+    # Raw kernel: exponential decay in sqrt(T) distance
+    K_raw = np.zeros((M, M))
+    for i in range(M):
+        for j in range(M):
+            if i == j:
+                continue
+            K_raw[i, j] = np.exp(-lambda_T * abs(sqrt_T[i] - sqrt_T[j]))
+
+    # Row-normalize: each row sums to 1 (all influence goes to neighbours)
+    K = np.zeros_like(K_raw)
+    for i in range(M):
+        row_sum = K_raw[i].sum()
+        if row_sum > 0:
+            K[i] = K_raw[i] / row_sum
+
+    return K
+
+
+def build_full_tensor(
+    W_asset: np.ndarray,
+    K_time: np.ndarray,
+    alphas_asset: np.ndarray,
+    alpha_time: float = 0.5,
+) -> tuple:
+    """Build the full (N*M, N*M) influence tensor via Kronecker product.
+
+    W_full = W_asset ⊗ K_time
+
+    Node ordering is ticker-major:
+      [(ticker_0, T_0), (ticker_0, T_1), ..., (ticker_0, T_{M-1}),
+       (ticker_1, T_0), ...]
+
+    The Kronecker product preserves sub-stochastic structure:
+    if W_asset and K_time both have row sums ≤ 1, so does W_full.
+
+    Actually, we blend asset influence and time influence:
+    - Same ticker, different maturity: influenced by time kernel
+    - Different ticker, same maturity: influenced by W_asset
+    - Different ticker, different maturity: influenced by both (product)
+
+    We construct: W_full[iM+j, kM+l] = W_asset[i,k] * K_time[j,l]
+    where i,k are ticker indices and j,l are maturity indices.
+
+    For same-ticker cross-maturity influence, we add alpha_time * K_time
+    on the block diagonal (ticker i with itself across maturities).
+
+    Args:
+        W_asset: (N, N) cross-asset influence matrix
+        K_time: (M, M) cross-maturity kernel
+        alphas_asset: (N,) self-trust per asset
+        alpha_time: fraction of residual self-trust allocated to cross-maturity
+
+    Returns:
+        W_full: (N*M, N*M) full tensor
+        alphas_full: (N*M,) self-trust per node
+    """
+    N = W_asset.shape[0]
+    M = K_time.shape[0]
+    NM = N * M
+
+    W_full = np.zeros((NM, NM))
+
+    for i in range(N):
+        for k in range(N):
+            if i == k:
+                # Same ticker, different maturities: use time kernel
+                # scaled by the asset's residual self-trust portion
+                for j in range(M):
+                    for l in range(M):
+                        if j != l:
+                            W_full[i * M + j, k * M + l] = alphas_asset[i] * alpha_time * K_time[j, l]
+            else:
+                # Different tickers: use W_asset, spread across maturity pairs
+                for j in range(M):
+                    for l in range(M):
+                        # Cross-asset influence: W_asset[i,k] at same maturity,
+                        # attenuated by K_time[j,l] at different maturities
+                        if j == l:
+                            W_full[i * M + j, k * M + l] = W_asset[i, k]
+                        else:
+                            W_full[i * M + j, k * M + l] = W_asset[i, k] * K_time[j, l]
+
+    # Alphas: residual self-trust = 1 - row_sum
+    alphas_full = 1.0 - W_full.sum(axis=1)
+    alphas_full = np.clip(alphas_full, 0.01, 0.99)
+
+    return W_full, alphas_full

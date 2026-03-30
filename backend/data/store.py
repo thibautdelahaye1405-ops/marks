@@ -47,6 +47,7 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_snap_ticker ON snapshots(ticker, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_snap_ticker_expiry ON snapshots(ticker, expiry, timestamp);
     """)
     conn.commit()
     conn.close()
@@ -81,17 +82,32 @@ def save_snapshot(chain_data) -> int:
     return snap_id
 
 
-def get_latest_snapshots(tickers: List[str]) -> Dict[str, dict]:
-    """Get the most recent snapshot for each ticker."""
+def get_latest_snapshots(keys: List[str]) -> Dict[str, dict]:
+    """Get the most recent snapshot for each key.
+
+    Keys can be:
+    - Plain tickers ("SPY") — returns latest snapshot regardless of expiry
+    - Node keys ("SPY:2025-04-17") — returns latest snapshot for that specific expiry
+    """
+    from ..utils.node_key import split_node_key, is_compound_key, make_node_key
+
     conn = _get_conn()
     results = {}
-    for t in tickers:
-        row = conn.execute(
-            "SELECT * FROM snapshots WHERE ticker=? ORDER BY timestamp DESC LIMIT 1",
-            (t,),
-        ).fetchone()
+    for key in keys:
+        ticker, expiry = split_node_key(key)
+        if expiry:
+            row = conn.execute(
+                "SELECT * FROM snapshots WHERE ticker=? AND expiry=? ORDER BY timestamp DESC LIMIT 1",
+                (ticker, expiry),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM snapshots WHERE ticker=? ORDER BY timestamp DESC LIMIT 1",
+                (ticker,),
+            ).fetchone()
         if row:
-            results[t] = {
+            result_key = make_node_key(row["ticker"], row["expiry"]) if is_compound_key(key) else row["ticker"]
+            results[result_key] = {
                 "ticker": row["ticker"],
                 "expiry": row["expiry"],
                 "T": row["T"],

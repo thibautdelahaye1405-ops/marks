@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback } from "react";
 import cytoscape from "cytoscape";
 import type { GraphData, SolveResponse } from "../types";
 import { observedColor, inferredColor, weightToOpacity, weightToWidth } from "../utils/colors";
+import { isCompoundKey, splitNodeKey, expiryLabel } from "../utils/nodeKey";
 
 interface Props {
   graphData: GraphData | null;
@@ -106,22 +107,33 @@ export default function GraphView({
     const elements: cytoscape.ElementDefinition[] = [];
 
     // Nodes — initial neutral styling; colors updated by separate effect
+    // In multi-expiry mode, tickers.length > assets.length (multiple nodes per asset)
+    const assetMap = Object.fromEntries(assets.map((a) => [a.ticker, a]));
     for (let i = 0; i < tickers.length; i++) {
-      const a = assets[i];
+      const nodeKey = tickers[i];
+      let label: string;
+      if (isCompoundKey(nodeKey)) {
+        const { ticker: tk, expiry } = splitNodeKey(nodeKey);
+        label = `${tk}\n${expiryLabel(expiry)}`;
+      } else {
+        label = nodeKey;
+      }
       elements.push({
         data: {
-          id: a.ticker,
-          label: a.ticker,
+          id: nodeKey,
+          label,
           color: observedColor(0.3),
           size: 60 + ranks[i] * 40,
         },
-        position: positions[a.ticker],
+        position: positions[nodeKey],
       });
     }
 
-    // Edges
-    const threshold = 0.01;
+    // Edges — in multi-expiry mode, only show edges above threshold
+    // and limit to avoid visual clutter with large tensors
+    const threshold = tickers.length > 20 ? 0.03 : 0.01;
     for (let i = 0; i < tickers.length; i++) {
+      if (!W[i]) continue;
       for (let j = 0; j < tickers.length; j++) {
         if (i === j || W[i][j] < threshold) continue;
         elements.push({
@@ -153,9 +165,10 @@ export default function GraphView({
             "border-width": 1,
             "border-color": "rgba(255,255,255,0.3)",
             label: "data(label)",
-            "font-size": "11px",
+            "font-size": "10px",
             "text-valign": "center",
             "text-halign": "center",
+            "text-wrap": "wrap",
             color: "#fff",
             "font-weight": "700",
             "text-outline-color": "data(color)",

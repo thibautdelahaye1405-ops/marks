@@ -9,6 +9,7 @@ import SigmoidSliders from "./SigmoidSliders";
 import type { SigmoidTraderParams } from "./SigmoidSliders";
 import Plot from "./Plot";
 import type { DistributionView } from "../types";
+import { tickerOf } from "../utils/nodeKey";
 
 type ViewMode = "smile" | "distributions";
 
@@ -277,7 +278,7 @@ export default function PriorCalibrationView() {
   if (!priorView) {
     return (
       <div style={{ padding: 20, color: "#94a3b8", textAlign: "center" }}>
-        No prior data for {ticker}. Fetch quotes and calibrate first.
+        No prior data for {tickerOf(ticker!)}. Fetch quotes and calibrate first.
       </div>
     );
   }
@@ -425,7 +426,7 @@ export default function PriorCalibrationView() {
                 : []),
             ]}
             layout={{
-              title: { text: `${ticker} -- Prior Smile`, font: { color: "#e2e8f0", size: 13 } },
+              title: { text: `${tickerOf(ticker!)} -- Prior Smile`, font: { color: "#e2e8f0", size: 13 } },
               paper_bgcolor: "#1e293b",
               plot_bgcolor: "#1e293b",
               font: { color: "#94a3b8" },

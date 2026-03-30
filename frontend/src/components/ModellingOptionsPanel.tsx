@@ -7,14 +7,17 @@ function HoldButton({ onAction, children, style }: {
   children: React.ReactNode;
   style?: React.CSSProperties;
 }) {
-  const timer = useRef<ReturnType<typeof setInterval>>();
+  const timer = useRef<ReturnType<typeof setTimeout | typeof setInterval>>();
   const actionRef = useRef(onAction);
   actionRef.current = onAction;
-  const stop = useCallback(() => { clearInterval(timer.current); timer.current = undefined; }, []);
+  const stop = useCallback(() => { clearTimeout(timer.current); clearInterval(timer.current); timer.current = undefined; }, []);
   const start = useCallback(() => {
     actionRef.current();
     stop();
-    timer.current = setInterval(() => actionRef.current(), 80);
+    // Delay 400ms before auto-repeat at 120ms
+    timer.current = setTimeout(() => {
+      timer.current = setInterval(() => actionRef.current(), 120);
+    }, 400);
   }, [stop]);
   useEffect(() => stop, [stop]);
   return (
@@ -25,7 +28,7 @@ function HoldButton({ onAction, children, style }: {
 }
 
 export default function ModellingOptionsPanel() {
-  const { lambda, eta, lambdaPrior, useBidAskFit, smileModel, setLambda, setEta, setLambdaPrior, setUseBidAskFit, setSmileModel } = useEngine();
+  const { lambda, eta, lambdaPrior, useBidAskFit, smileModel, lambdaT, setLambda, setEta, setLambdaPrior, setUseBidAskFit, setSmileModel, setLambdaT } = useEngine();
 
   const [repoGc, setRepoGc] = useState(0.0);
   const [treasuryCurve, setTreasuryCurve] = useState<{ date: string; tenors: number[]; rates: number[] } | null>(null);
@@ -59,10 +62,9 @@ export default function ModellingOptionsPanel() {
   lambdaPriorRef.current = lambdaPrior;
 
   const nudgeLambda = useCallback((dir: number) => {
-    const logVal = Math.log10(lambdaRef.current) + dir * logStep;
-    const clamped = Math.pow(10, Math.max(-2, Math.min(1, logVal)));
-    lambdaRef.current = clamped;
-    useEngine.getState().setLambda(clamped);
+    const next = Math.max(0, Math.min(2.0, lambdaRef.current + dir * 0.01));
+    lambdaRef.current = next;
+    useEngine.getState().setLambda(next);
   }, []);
 
   const nudgeEta = useCallback((dir: number) => {
@@ -73,9 +75,17 @@ export default function ModellingOptionsPanel() {
   }, []);
 
   const nudgeLambdaPrior = useCallback((dir: number) => {
-    const next = Math.max(0, Math.min(0.5, lambdaPriorRef.current + dir * 0.05));
+    const next = Math.max(0, Math.min(0.5, lambdaPriorRef.current + dir * 0.01));
     lambdaPriorRef.current = next;
     useEngine.getState().setLambdaPrior(next);
+  }, []);
+
+  const lambdaTRef = useRef(lambdaT);
+  lambdaTRef.current = lambdaT;
+  const nudgeLambdaT = useCallback((dir: number) => {
+    const next = Math.max(0.1, Math.min(10, lambdaTRef.current + dir * 0.2));
+    lambdaTRef.current = next;
+    useEngine.getState().setLambdaT(next);
   }, []);
 
   return (
@@ -93,12 +103,12 @@ export default function ModellingOptionsPanel() {
             </HoldButton>
             <input
               type="range"
-              min={-2}
-              max={1}
-              step={logStep}
-              value={Math.log10(lambda)}
+              min={0}
+              max={2.0}
+              step={0.01}
+              value={lambda}
               onChange={(e) =>
-                setLambda(Math.pow(10, parseFloat(e.target.value)))
+                setLambda(parseFloat(e.target.value))
               }
               style={sliderStyle}
             />
@@ -106,7 +116,7 @@ export default function ModellingOptionsPanel() {
               +
             </HoldButton>
           </div>
-          <span style={rangeHint}>0.01 -- 10</span>
+          <span style={rangeHint}>0 -- 2.0</span>
         </label>
       </div>
 
@@ -152,7 +162,7 @@ export default function ModellingOptionsPanel() {
               type="range"
               min={0}
               max={0.5}
-              step={0.05}
+              step={0.01}
               value={lambdaPrior}
               onChange={(e) =>
                 setLambdaPrior(parseFloat(e.target.value))
@@ -207,6 +217,34 @@ export default function ModellingOptionsPanel() {
             UST {treasuryCurve.date}: 1M={((treasuryCurve.rates[0] ?? 0) * 100).toFixed(1)}% 1Y={((treasuryCurve.rates[3] ?? 0) * 100).toFixed(1)}%
           </div>
         )}
+      </div>
+
+      {/* Time kernel */}
+      <div>
+        <div style={sectionTitle}>Cross-maturity</div>
+        <label style={labelStyle}>
+          <span style={labelText}>
+            {"\u03BB"}_T {lambdaT.toFixed(1)}
+          </span>
+          <div style={sliderRow}>
+            <HoldButton onAction={() => nudgeLambdaT(-1)} style={nudgeBtn}>
+              {"\u2212"}
+            </HoldButton>
+            <input
+              type="range"
+              min={0.1}
+              max={10}
+              step={0.1}
+              value={lambdaT}
+              onChange={(e) => setLambdaT(parseFloat(e.target.value))}
+              style={sliderStyle}
+            />
+            <HoldButton onAction={() => nudgeLambdaT(1)} style={nudgeBtn}>
+              +
+            </HoldButton>
+          </div>
+          <span style={rangeHint}>0.1 (strong coupling) -- 10 (weak)</span>
+        </label>
       </div>
 
       {/* Smile model */}

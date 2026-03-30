@@ -9,6 +9,7 @@ import type { LqdTraderParams } from "./LqdSliders";
 import SigmoidSliders from "./SigmoidSliders";
 import type { SigmoidTraderParams } from "./SigmoidSliders";
 import type { NodeDistributionResponse, SmileData, QuoteSnapshot } from "../types";
+import { tickerOf } from "../utils/nodeKey";
 
 type ViewMode = "smile" | "distributions";
 

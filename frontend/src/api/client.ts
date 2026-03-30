@@ -12,6 +12,7 @@ import type {
   CatalogResponse,
   UniverseSelectResponse,
   AddTickerResponse,
+  AvailableExpiries,
 } from "../types";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -200,4 +201,22 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ forward }),
     }),
+
+  // Multi-expiry
+  getAvailableExpiries: (ticker: string) =>
+    request<AvailableExpiries>(`/expiries/${ticker}`),
+
+  setExpirySelection: (selections: Record<string, string[]>) =>
+    request<{ status: string }>("/expiry-selection", {
+      method: "POST",
+      body: JSON.stringify({ selections }),
+    }),
+
+  getExpirySelection: () =>
+    request<{ selections: Record<string, string[]> }>("/expiry-selection"),
+
+  getTimeKernel: (lambdaT?: number) =>
+    request<{ K: number[][]; expiries: string[]; T_values: number[]; labels: string[]; lambda_T: number }>(
+      "/time-kernel" + (lambdaT != null ? `?lambda_T=${lambdaT}` : "")
+    ),
 };

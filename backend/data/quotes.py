@@ -383,16 +383,97 @@ def fetch_universe_quotes(
     rate_func=None,
     dividend_map: Optional[Dict] = None,
     repo_map: Optional[Dict[str, float]] = None,
+    selected_expiries: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, OptionChainData]:
-    """Fetch option chains for all tickers in the universe."""
+    """Fetch option chains for all tickers in the universe.
+
+    If selected_expiries is provided, fetches multiple expiries per ticker
+    and returns dict keyed by node key "TICKER:EXPIRY".
+    Otherwise, fetches single closest expiry and keys by ticker.
+    """
+    from ..utils.node_key import make_node_key
+
     results = {}
     for t in tickers:
         div_info = dividend_map.get(t) if dividend_map else None
         repo = repo_map.get(t, 0.0) if repo_map else 0.0
-        data = fetch_option_chain(
-            t, target_maturity_days, r=r,
-            rate_func=rate_func, dividend_info=div_info, repo_rate=repo,
+
+        if selected_expiries and t in selected_expiries:
+            # Multi-expiry: fetch each selected expiry
+            chains = fetch_option_chains(
+                t, selected_expiries[t], r=r,
+                rate_func=rate_func, dividend_info=div_info, repo_rate=repo,
+            )
+            results.update(chains)
+        else:
+            # Single-expiry (backward compat)
+            data = fetch_option_chain(
+                t, target_maturity_days, r=r,
+                rate_func=rate_func, dividend_info=div_info, repo_rate=repo,
+            )
+            if data is not None:
+                if selected_expiries is not None:
+                    # Multi-expiry mode but no selection for this ticker: use node key
+                    results[make_node_key(t, data.expiry)] = data
+                else:
+                    results[t] = data
+    return results
+
+
+def fetch_available_expiries(ticker: str) -> List[str]:
+    """Fetch all available option expiry dates for a ticker from Yahoo Finance.
+
+    Returns list of ISO date strings (e.g. ["2025-04-17", "2025-05-16", ...]),
+    filtered to expiries at least 7 days out, sorted ascending.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        expirations = tk.options
+        if not expirations:
+            return []
+        min_date = datetime.now() + timedelta(days=7)
+        valid = [e for e in expirations
+                 if datetime.strptime(e, "%Y-%m-%d") >= min_date]
+        return sorted(valid)
+    except Exception:
+        return []
+
+
+def fetch_option_chains(
+    ticker: str,
+    expiries: List[str],
+    min_oi: int = 10,
+    max_strikes: int = 30,
+    r: float = 0.045,
+    rate_func=None,
+    dividend_info=None,
+    repo_rate: float = 0.0,
+) -> Dict[str, OptionChainData]:
+    """Fetch option chains for multiple expiries of a single ticker.
+
+    Returns dict keyed by node key "TICKER:EXPIRY".
+    Calls fetch_option_chain once per expiry, reusing the existing processing logic.
+    """
+    from ..utils.node_key import make_node_key
+
+    results = {}
+    for exp in expiries:
+        try:
+            exp_date = datetime.strptime(exp, "%Y-%m-%d")
+            target_days = max((exp_date - datetime.now()).days, 7)
+        except ValueError:
+            continue
+
+        chain = fetch_option_chain(
+            ticker, target_maturity_days=target_days,
+            min_oi=min_oi, max_strikes=max_strikes,
+            r=r, rate_func=rate_func,
+            dividend_info=dividend_info, repo_rate=repo_rate,
         )
-        if data is not None:
-            results[t] = data
+        if chain is not None and chain.expiry == exp:
+            results[make_node_key(ticker, exp)] = chain
+        elif chain is not None:
+            # Got a different expiry (closest match) — still use it with its actual expiry
+            results[make_node_key(ticker, chain.expiry)] = chain
+
     return results

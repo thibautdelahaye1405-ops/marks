@@ -5,7 +5,7 @@ interface SlideOutPanelProps {
   onClose: () => void;
   title: string;
   children: React.ReactNode;
-  width?: number;
+  width?: number | string;
 }
 
 export default function SlideOutPanel({
@@ -55,7 +55,7 @@ export default function SlideOutPanel({
           zIndex: 9999,
           display: "flex",
           flexDirection: "column",
-          transform: isOpen ? "translateX(0)" : `translateX(${width}px)`,
+          transform: isOpen ? "translateX(0)" : "translateX(100%)",
           transition: "transform 0.25s ease",
           boxShadow: isOpen ? "-4px 0 24px rgba(0,0,0,0.5)" : "none",
         }}

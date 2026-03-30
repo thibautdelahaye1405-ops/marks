@@ -307,7 +307,8 @@ class EngineConfig:
     epsilon_tail: float = 0.01          # lower bound for tail coefficients β₁, β₂
     lambda_prior: float = 0.10         # prior-anchoring strength for SVI fit (0 = pure market)
     use_bid_ask_fit: bool = True       # use bid-ask dead-zone loss in SVI fit
-    smile_model: str = "svi"           # smile model: "svi" or "lqd"
+    smile_model: str = "svi"           # smile model: "svi", "lqd", or "sigmoid"
+    lambda_T: float = 2.0              # time kernel decay for cross-maturity influence
 
     def repo_rate_for(self, ticker: str) -> float:
         return self.repo_overrides.get(ticker, self.repo_rate_gc)

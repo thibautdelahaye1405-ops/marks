@@ -1,12 +1,14 @@
 import { useState, useMemo, useCallback } from "react";
 import { useEngine } from "../hooks/useEngine";
 import { sectorColor } from "../utils/colors";
+import { expiryLabel } from "../utils/nodeKey";
 import type { Asset } from "../types";
 
 export default function ReferentialPanel() {
   const {
     catalog, activeTickers, selectUniverse, saveSelection, addTicker,
     loading, universeUnsaved,
+    availableExpiries, selectedExpiries, fetchExpiries, setExpirySelection,
   } = useEngine();
 
   const [search, setSearch] = useState("");
@@ -101,34 +103,216 @@ export default function ReferentialPanel() {
   }, []);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+    <div style={{ display: "flex", gap: 16, height: "100%" }}>
+      {/* ── LEFT COLUMN: Data source + Expiry matrix ── */}
+      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 16 }}>
+
       {/* Data source */}
       <div>
         <div style={sectionTitle}>Data source</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ display: "flex", gap: 12 }}>
           <label style={radioLabel}>
-            <input
-              type="radio"
-              name="dataSource"
-              value="yahoo"
-              defaultChecked
-              style={radioStyle}
-            />
-            <span style={{ color: "#e2e8f0" }}>Yahoo Finance</span>
+            <input type="radio" name="dataSource" value="yahoo" defaultChecked style={radioStyle} />
+            <span style={{ color: "#e2e8f0", fontSize: 11 }}>Yahoo Finance</span>
           </label>
           <label style={{ ...radioLabel, opacity: 0.4 }}>
             <input type="radio" name="dataSource" value="bloomberg" disabled style={radioStyle} />
-            <span style={{ color: "#94a3b8" }}>Bloomberg</span>
-          </label>
-          <label style={{ ...radioLabel, opacity: 0.4 }}>
-            <input type="radio" name="dataSource" value="refinitiv" disabled style={radioStyle} />
-            <span style={{ color: "#94a3b8" }}>Refinitiv</span>
+            <span style={{ color: "#94a3b8", fontSize: 11 }}>Bloomberg</span>
           </label>
         </div>
       </div>
 
+      {/* Expiry matrix */}
+      <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+        <div style={sectionTitle}>Expiries (multi-maturity)</div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+          <button
+            onClick={() => { for (const t of activeTickers) fetchExpiries(t); }}
+            disabled={loading || activeTickers.length === 0}
+            style={smallBtn}
+          >
+            Fetch expiries
+          </button>
+          <button onClick={() => {
+            const payload = { tickers: activeTickers, expiries: selectedExpiries };
+            localStorage.setItem("marks_referential_selection", JSON.stringify(payload));
+          }} style={tinyBtn} title="Save current assets + expiries selection">Save</button>
+          <button onClick={() => {
+            try {
+              const raw = localStorage.getItem("marks_referential_selection");
+              if (!raw) return;
+              const payload = JSON.parse(raw);
+              if (payload.tickers) selectUniverse(payload.tickers);
+              if (payload.expiries) {
+                for (const [t, exps] of Object.entries(payload.expiries)) {
+                  setExpirySelection(t, exps as string[]);
+                }
+              }
+            } catch {}
+          }} style={tinyBtn} title="Load last saved selection">Load</button>
+          {activeTickers.some((t) => availableExpiries[t]) && (
+            <>
+              <button onClick={() => {
+                for (const t of activeTickers) {
+                  const ae = availableExpiries[t];
+                  if (ae) setExpirySelection(t, ae.expiries.slice(0, 3));
+                }
+              }} style={tinyBtn}>Front 3</button>
+              <button onClick={() => {
+                for (const t of activeTickers) {
+                  const ae = availableExpiries[t];
+                  if (ae) {
+                    // Pick monthly: ~30d apart, take first of each month
+                    const monthly: string[] = [];
+                    let lastMonth = -1;
+                    for (const e of ae.expiries) {
+                      const m = new Date(e + "T00:00:00").getMonth();
+                      if (m !== lastMonth) { monthly.push(e); lastMonth = m; }
+                    }
+                    setExpirySelection(t, monthly);
+                  }
+                }
+              }} style={tinyBtn}>Monthly</button>
+              <button onClick={() => {
+                for (const t of activeTickers) {
+                  const ae = availableExpiries[t];
+                  if (ae) {
+                    // Quarterly: Mar, Jun, Sep, Dec
+                    const qMonths = new Set([2, 5, 8, 11]);
+                    const quarterly = ae.expiries.filter((e) => {
+                      const m = new Date(e + "T00:00:00").getMonth();
+                      return qMonths.has(m);
+                    });
+                    setExpirySelection(t, quarterly.length > 0 ? quarterly : ae.expiries.slice(0, 3));
+                  }
+                }
+              }} style={tinyBtn}>Quarterly</button>
+              <button onClick={() => {
+                for (const t of activeTickers) {
+                  const ae = availableExpiries[t];
+                  if (ae) setExpirySelection(t, ae.expiries);
+                }
+              }} style={tinyBtn}>All</button>
+              <button onClick={() => {
+                for (const t of activeTickers) setExpirySelection(t, []);
+              }} style={tinyBtn}>Clear</button>
+            </>
+          )}
+        </div>
+
+        {(() => {
+          const expMap = new Map<string, number>();
+          for (const t of activeTickers) {
+            const ae = availableExpiries[t];
+            if (!ae) continue;
+            ae.expiries.forEach((e, i) => {
+              if (!expMap.has(e)) expMap.set(e, ae.T_values[i]);
+            });
+          }
+          const allExpiries = [...expMap.entries()].sort((a, b) => a[1] - b[1]);
+
+          if (allExpiries.length === 0) {
+            return (
+              <span style={{ fontSize: 10, color: "#475569" }}>
+                Click "Fetch expiries" to load available dates from Yahoo.
+              </span>
+            );
+          }
+
+          return (
+            <div style={{ overflowX: "auto", overflowY: "auto", flex: 1, border: "1px solid #334155", borderRadius: 4, background: "#0f172a" }}>
+              <table style={{ borderCollapse: "collapse", fontSize: 9 }}>
+                <thead>
+                  <tr>
+                    <th style={{ ...matrixHeader, position: "sticky", left: 0, top: 0, background: "#0f172a", zIndex: 2 }}></th>
+                    {allExpiries.map(([exp, T]) => {
+                      // Check if all active tickers that have this expiry are selected
+                      const tickersWithExp = activeTickers.filter((t) => {
+                        const ae = availableExpiries[t];
+                        return ae && ae.expiries.includes(exp);
+                      });
+                      const allSelected = tickersWithExp.length > 0 && tickersWithExp.every((t) =>
+                        (selectedExpiries[t] ?? []).includes(exp)
+                      );
+                      return (
+                        <th key={exp} style={{ ...matrixHeader, position: "sticky", top: 0, background: "#0f172a", zIndex: 1 }} title={exp}>
+                          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 1 }}>
+                            <input
+                              type="checkbox"
+                              checked={allSelected}
+                              onChange={() => {
+                                for (const t of tickersWithExp) {
+                                  const cur = selectedExpiries[t] ?? [];
+                                  const next = allSelected
+                                    ? cur.filter((e) => e !== exp)
+                                    : cur.includes(exp) ? cur : [...cur, exp];
+                                  setExpirySelection(t, next);
+                                }
+                              }}
+                              style={{ accentColor: "#6366f1", width: 10, height: 10, cursor: "pointer" }}
+                              title={`Toggle ${exp} for all assets`}
+                            />
+                            <span>{expiryLabel(exp, T)}</span>
+                          </div>
+                        </th>
+                      );
+                    })}
+                  </tr>
+                </thead>
+                <tbody>
+                  {activeTickers.map((t) => {
+                    const ae = availableExpiries[t];
+                    const available = new Set(ae?.expiries ?? []);
+                    const sel = new Set(selectedExpiries[t] ?? []);
+                    return (
+                      <tr key={t}>
+                        <td style={{ ...matrixHeader, position: "sticky", left: 0, background: "#0f172a", zIndex: 1, textAlign: "right", fontWeight: 600 }}>
+                          {t}
+                        </td>
+                        {allExpiries.map(([exp]) => {
+                          const avail = available.has(exp);
+                          const on = sel.has(exp);
+                          return (
+                            <td key={exp} style={{ padding: 1, textAlign: "center" }}>
+                              <button
+                                disabled={!avail}
+                                onClick={() => {
+                                  const next = on
+                                    ? (selectedExpiries[t] ?? []).filter((e) => e !== exp)
+                                    : [...(selectedExpiries[t] ?? []), exp];
+                                  setExpirySelection(t, next);
+                                }}
+                                style={{
+                                  width: 22, height: 18, padding: 0, fontSize: 8,
+                                  border: "1px solid " + (on ? "#6366f1" : "#334155"),
+                                  borderRadius: 2, cursor: avail ? "pointer" : "default",
+                                  background: on ? "#4f46e5" : avail ? "#1e293b" : "#0f172a",
+                                  color: on ? "#fff" : avail ? "#64748b" : "#1e293b",
+                                  opacity: avail ? 1 : 0.3,
+                                }}
+                              >
+                                {on ? "\u2713" : "\u00B7"}
+                              </button>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          );
+        })()}
+      </div>
+
+      </div>{/* end left column */}
+
+      {/* ── RIGHT COLUMN: Asset selector ── */}
+      <div style={{ width: 260, flexShrink: 0, display: "flex", flexDirection: "column", gap: 12 }}>
+
       {/* Universe */}
-      <div>
+      <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
         <div style={{ ...sectionTitle, marginBottom: 6 }}>
           Universe
           <span style={{ fontWeight: 400, fontSize: 10, color: "#64748b", marginLeft: 8 }}>
@@ -172,7 +356,7 @@ export default function ReferentialPanel() {
         {/* Sector groups */}
         <div
           style={{
-            maxHeight: 380,
+            flex: 1,
             overflowY: "auto",
             border: "1px solid #334155",
             borderRadius: 4,
@@ -327,6 +511,8 @@ export default function ReferentialPanel() {
           </span>
         )}
       </div>
+
+      </div>{/* end right column */}
     </div>
   );
 }
@@ -374,4 +560,23 @@ const smallBtn: React.CSSProperties = {
   borderRadius: 3,
   color: "#94a3b8",
   cursor: "pointer",
+};
+
+const tinyBtn: React.CSSProperties = {
+  padding: "1px 6px",
+  fontSize: 9,
+  background: "#0f172a",
+  border: "1px solid #334155",
+  borderRadius: 2,
+  color: "#64748b",
+  cursor: "pointer",
+};
+
+const matrixHeader: React.CSSProperties = {
+  padding: "3px 6px",
+  color: "#94a3b8",
+  fontSize: 9,
+  fontWeight: 600,
+  whiteSpace: "nowrap",
+  borderBottom: "1px solid #334155",
 };

@@ -6,9 +6,11 @@ import QuoteTable from "./components/QuoteTable";
 import MatrixEditor from "./components/MatrixEditor";
 import ErrorBoundary from "./components/ErrorBoundary";
 import SlideOutPanel from "./components/SlideOutPanel";
+import { splitNodeKey, tickerOf, expiryLabel } from "./utils/nodeKey";
 import ModellingOptionsPanel from "./components/ModellingOptionsPanel";
 import ReferentialPanel from "./components/ReferentialPanel";
 import FetchPriorsModal from "./components/FetchPriorsModal";
+import ObservedMatrixPanel from "./components/ObservedMatrixPanel";
 
 const SmileView = lazy(() => import("./components/SmileView"));
 const ObservedNodeView = lazy(() => import("./components/ObservedNodeView"));
@@ -18,8 +20,9 @@ const PropagationViz = lazy(() => import("./components/PropagationViz"));
 const PriorCalibrationView = lazy(
   () => import("./components/PriorCalibrationView")
 );
+const TimeKernelView = lazy(() => import("./components/TimeKernelView"));
 
-type MainView = "graph" | "matrix" | "allSmiles";
+type MainView = "graph" | "matrix" | "timeKernel" | "allSmiles";
 type DetailTab = "smile" | "prior" | "propagation";
 
 const Loading = () => (
@@ -45,6 +48,7 @@ function App() {
   const [modellingOpen, setModellingOpen] = useState(false);
   const [referentialOpen, setReferentialOpen] = useState(false);
   const [fetchPriorsOpen, setFetchPriorsOpen] = useState(false);
+  const [observedMatrixOpen, setObservedMatrixOpen] = useState(false);
 
   const toggleModelling = useCallback(() => setModellingOpen((v) => !v), []);
   const toggleReferential = useCallback(() => setReferentialOpen((v) => !v), []);
@@ -87,7 +91,7 @@ function App() {
       <div style={bodyStyle}>
         {/* Left sidebar: asset selection */}
         <div style={sidebarStyle}>
-          <QuoteTable />
+          <QuoteTable onOpenObservedMatrix={() => setObservedMatrixOpen(true)} />
         </div>
 
         {/* Main content area */}
@@ -98,6 +102,7 @@ function App() {
               [
                 ["graph", "Graph"],
                 ["matrix", "W Matrix"],
+                ["timeKernel", "K Time"],
                 ["allSmiles", "All Smiles"],
               ] as [MainView, string][]
             ).map(([key, label]) => (
@@ -137,6 +142,7 @@ function App() {
                     />
                   )}
                   {mainView === "matrix" && <MatrixEditor />}
+                  {mainView === "timeKernel" && <TimeKernelView />}
                   {mainView === "allSmiles" && (
                     <SurfaceView solveResult={solveResult} />
                   )}
@@ -150,7 +156,7 @@ function App() {
                 {/* Asset header */}
                 {(() => {
                   const q = selectedQuote;
-                  const asset = universe.find((a) => a.ticker === selectedNode);
+                  const asset = universe.find((a) => a.ticker === tickerOf(selectedNode!));
                   const name = asset?.name ?? "";
                   const spot = q?.spot;
                   const prevSpot = q?.prev_spot;
@@ -161,7 +167,7 @@ function App() {
                   return (
                     <div style={assetHeaderStyle}>
                       <span style={{ fontWeight: 700, color: "#e2e8f0", fontSize: 13 }}>
-                        {selectedNode}
+                        {tickerOf(selectedNode!)}
                       </span>
                       <span style={{ color: "#94a3b8", fontSize: 11 }}>{name}</span>
                       {spot != null && (
@@ -279,11 +285,13 @@ function App() {
         isOpen={referentialOpen}
         onClose={() => setReferentialOpen(false)}
         title="Referential"
+        width="calc(100vw - 175px)"
       >
         <ReferentialPanel />
       </SlideOutPanel>
 
       <FetchPriorsModal isOpen={fetchPriorsOpen} onClose={closeFetchPriors} />
+      <ObservedMatrixPanel isOpen={observedMatrixOpen} onClose={() => setObservedMatrixOpen(false)} />
     </div>
   );
 }

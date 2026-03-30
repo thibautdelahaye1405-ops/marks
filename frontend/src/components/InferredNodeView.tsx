@@ -4,6 +4,7 @@ import { useEngine } from "../hooks/useEngine";
 import DistributionTripleView from "./DistributionTripleView";
 import Plot from "./Plot";
 import type { NodeDistributionResponse } from "../types";
+import { tickerOf } from "../utils/nodeKey";
 
 type ViewMode = "smile" | "distributions";
 
@@ -24,7 +25,7 @@ export default function InferredNodeView({ ticker }: Props) {
   if (!data) {
     return (
       <div style={{ padding: 20, color: "#94a3b8", textAlign: "center" }}>
-        Loading distribution for {ticker}...
+        Loading distribution for {tickerOf(ticker)}...
       </div>
     );
   }
@@ -55,7 +56,7 @@ export default function InferredNodeView({ ticker }: Props) {
           </button>
         ))}
         <span style={{ fontSize: 10, color: "#64748b", marginLeft: "auto", alignSelf: "center" }}>
-          {ticker} (inferred) | W2: {data.wasserstein_dist.toFixed(4)}
+          {tickerOf(ticker)} (inferred) | W2: {data.wasserstein_dist.toFixed(4)}
         </span>
       </div>
 
@@ -109,7 +110,7 @@ export default function InferredNodeView({ ticker }: Props) {
           ]}
           layout={{
             title: {
-              text: `${ticker} -- Inferred Smile`,
+              text: `${tickerOf(ticker)} -- Inferred Smile`,
               font: { color: "#e2e8f0", size: 13 },
             },
             paper_bgcolor: "#1e293b",

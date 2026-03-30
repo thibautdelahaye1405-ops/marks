@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import cytoscape from "cytoscape";
 import type { SolveResponse, GraphData } from "../types";
 import { observedColor, inferredColor } from "../utils/colors";
+import { tickerOf } from "../utils/nodeKey";
 
 interface Props {
   solveResult: SolveResponse | null;
@@ -172,7 +173,7 @@ export default function PropagationViz({
   if (solveResult && !isObs) {
     return (
       <div style={msgStyle}>
-        <b>{selectedNode}</b> is inferred — select an observed node to see outward propagation
+        <b>{tickerOf(selectedNode)}</b> is inferred — select an observed node to see outward propagation
       </div>
     );
   }
@@ -184,7 +185,7 @@ export default function PropagationViz({
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
       <div style={{ padding: "8px 12px 4px", fontSize: 11, color: "#94a3b8" }}>
-        Total influence from <b style={{ color: "#e2e8f0" }}>{selectedNode}</b> through the network
+        Total influence from <b style={{ color: "#e2e8f0" }}>{tickerOf(selectedNode)}</b> through the network
         <span style={{ marginLeft: 8, fontSize: 10, color: "#475569" }}>
           value = full propagation (direct + multi-hop)
         </span>

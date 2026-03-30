@@ -15,6 +15,7 @@ class Asset(BaseModel):
 
 
 class QuoteSnapshot(BaseModel):
+    node_key: Optional[str] = None  # compound key "TICKER:EXPIRY" (multi-expiry)
     ticker: str
     expiry: str
     T: float
@@ -36,6 +37,7 @@ class QuoteSnapshot(BaseModel):
 
 
 class SmileData(BaseModel):
+    node_key: Optional[str] = None  # compound key (multi-expiry)
     ticker: str
     strikes: List[float]
     iv_prior: List[float]
@@ -55,7 +57,8 @@ class SolveRequest(BaseModel):
     added_quotes: Optional[Dict[str, List[List[float]]]] = None  # ticker -> [[strike, iv], ...]
     lambda_prior: float = 0.10         # prior-anchoring strength for SVI fit
     use_bid_ask_fit: bool = True       # use bid-ask dead-zone loss in SVI fit
-    smile_model: str = "svi"           # smile model: "svi" or "lqd"
+    smile_model: str = "svi"           # smile model: "svi", "lqd", or "sigmoid"
+    lambda_T: float = 2.0              # time kernel decay for cross-maturity influence
 
 
 class SolveResponse(BaseModel):
@@ -167,3 +170,13 @@ class AddTickerRequest(BaseModel):
 class CatalogResponse(BaseModel):
     assets: List[Asset]
     active_tickers: List[str]
+
+
+class AvailableExpiriesResponse(BaseModel):
+    ticker: str
+    expiries: List[str]
+    T_values: List[float]
+
+
+class ExpirySelectionRequest(BaseModel):
+    selections: Dict[str, List[str]]  # ticker -> list of expiry dates

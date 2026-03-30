@@ -51,6 +51,14 @@ interface EngineState {
   // Universe dirty flag (unsaved selection changes)
   universeUnsaved: boolean;
 
+  // Multi-expiry
+  selectedExpiries: Record<string, string[]>;  // ticker -> selected expiry dates
+  availableExpiries: Record<string, { ticker: string; expiries: string[]; T_values: number[] }>;
+  lambdaT: number;  // time kernel decay
+  setLambdaT: (v: number) => void;
+  fetchExpiries: (ticker: string) => Promise<void>;
+  setExpirySelection: (ticker: string, expiries: string[]) => void;
+
   // Actions
   fetchCatalog: () => Promise<void>;
   fetchUniverse: () => Promise<void>;
@@ -110,7 +118,7 @@ export const useEngine = create<EngineState>((set, get) => ({
   selectedNode: null,
   loading: false,
   error: null,
-  lambda: 1.0,
+  lambda: 0.0,
   eta: 0.01,
   lambdaPrior: 0.10,
   useBidAskFit: true,
@@ -126,6 +134,9 @@ export const useEngine = create<EngineState>((set, get) => ({
   priorsCalibrated: false,
   priorsVersion: 0,
   universeUnsaved: false,
+  selectedExpiries: {},
+  availableExpiries: {},
+  lambdaT: 2.0,
 
   fetchCatalog: async () => {
     try {
@@ -225,12 +236,16 @@ export const useEngine = create<EngineState>((set, get) => ({
     try {
       const quotes = await api.getLatestQuotes();
       if (Object.keys(quotes).length > 0) {
-        const { observedTickers } = get();
+        const { observedTickers, selectedNode } = get();
         const tickers = Object.keys(quotes);
         const kept = observedTickers.length > 0
           ? observedTickers.filter((t) => tickers.includes(t))
           : tickers;
         set({ quotes, observedTickers: kept });
+        // Auto-select first node if nothing selected (no recalc — just show existing data)
+        if (!selectedNode && tickers.length > 0) {
+          set({ selectedNode: tickers[0] });
+        }
       }
     } catch {
       // Silently ignore — quotes will be empty until user fetches
@@ -307,12 +322,16 @@ export const useEngine = create<EngineState>((set, get) => ({
   },
 
   fitAllSnapshots: async () => {
-    set({ loading: true, error: null });
+    const { smileModel } = get();
+    set((s) => ({ loading: true, error: null, computing: s.computing + 1 }));
     try {
+      // Calibrate all priors first, then fit all snapshots
+      await api.calibratePriors(smileModel);
+      set((s) => ({ priorsCalibrated: true, priorsVersion: s.priorsVersion + 1 }));
       await get().fit();
-      set({ loading: false });
+      set((s) => ({ loading: false, computing: s.computing - 1 }));
     } catch (e: any) {
-      set({ error: e.message, loading: false });
+      set((s) => ({ error: e.message, loading: false, computing: s.computing - 1 }));
     }
   },
 
@@ -359,7 +378,7 @@ export const useEngine = create<EngineState>((set, get) => ({
   propagate: async () => {
     const {
       lambda, eta, lambdaPrior, useBidAskFit, smileModel, shockNudges, alphaOverrides, graphData,
-      observedTickers, excludedQuotes, addedQuotes,
+      observedTickers, excludedQuotes, addedQuotes, lambdaT,
     } = get();
     const seq = ++_propagateSeq;
     set({ loading: true, error: null });
@@ -372,10 +391,11 @@ export const useEngine = create<EngineState>((set, get) => ({
         lambda_prior: lambdaPrior,
         use_bid_ask_fit: useBidAskFit,
         smile_model: smileModel,
+        lambda_T: lambdaT,
         shock_nudges: Object.keys(shockNudges).length > 0 ? shockNudges : null,
         alpha_overrides:
           Object.keys(alphaOverrides).length > 0 ? alphaOverrides : null,
-        W_override: graphData?.W ?? null,
+        W_override: null,  // let server build W from assets + time kernel
         observed_tickers: observedTickers.length > 0 ? observedTickers : null,
         excluded_quotes: excl,
         added_quotes: added,
@@ -403,8 +423,11 @@ export const useEngine = create<EngineState>((set, get) => ({
   setSelectedNode: (ticker) => {
     set({ selectedNode: ticker });
     if (ticker && Object.keys(get().quotes).length > 0) {
+      // Always calibrate prior (fast, needed for prior tab)
       get().calibrateSinglePrior(ticker);
-      if (get().observedTickers.includes(ticker)) {
+      // Only fit if no existing result for this node
+      const existing = get().solveResult?.nodes[ticker];
+      if (!existing && get().observedTickers.includes(ticker)) {
         get().fitSingleAsset(ticker);
       }
     }
@@ -428,6 +451,30 @@ export const useEngine = create<EngineState>((set, get) => ({
   setSmileModel: (model) => {
     set({ smileModel: model });
     _recalcSelected(get);
+  },
+
+  setLambdaT: (v) => {
+    set({ lambdaT: v });
+  },
+
+  fetchExpiries: async (ticker: string) => {
+    try {
+      const result = await api.getAvailableExpiries(ticker);
+      set((s) => ({
+        availableExpiries: { ...s.availableExpiries, [ticker]: result },
+      }));
+    } catch {
+      // silently ignore
+    }
+  },
+
+  setExpirySelection: (ticker: string, expiries: string[]) => {
+    set((s) => {
+      const updated = { ...s.selectedExpiries, [ticker]: expiries };
+      // Sync to backend
+      api.setExpirySelection(updated).catch(() => {});
+      return { selectedExpiries: updated };
+    });
   },
 
   setShockNudge: (ticker, nudge) =>

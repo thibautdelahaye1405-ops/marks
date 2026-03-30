@@ -8,6 +8,7 @@ export interface Asset {
 }
 
 export interface QuoteSnapshot {
+  node_key?: string;  // compound key "TICKER:EXPIRY" (multi-expiry)
   ticker: string;
   expiry: string;
   T: number;
@@ -29,6 +30,7 @@ export interface QuoteSnapshot {
 }
 
 export interface SmileData {
+  node_key?: string;  // compound key (multi-expiry)
   ticker: string;
   strikes: number[];
   iv_prior: (number | null)[];
@@ -49,6 +51,7 @@ export interface SolveRequest {
   lambda_prior: number;
   use_bid_ask_fit: boolean;
   smile_model: string;
+  lambda_T?: number;  // time kernel decay for cross-maturity influence
 }
 
 export interface SolveResponse {
@@ -115,4 +118,14 @@ export interface AddTickerResponse {
   status: string;
   asset: Asset;
   tickers: string[];
+}
+
+export interface AvailableExpiries {
+  ticker: string;
+  expiries: string[];
+  T_values: number[];
+}
+
+export interface ExpirySelection {
+  selections: Record<string, string[]>;
 }

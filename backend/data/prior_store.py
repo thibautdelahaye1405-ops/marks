@@ -36,16 +36,32 @@ def list_saved_priors() -> Dict[str, dict]:
     """Scan the priors directory for saved prior JSON files.
 
     Returns:
-        dict of ticker -> {filename, timestamp (ISO), ticker}
+        dict of key -> {filename, timestamp (ISO), ticker}
+        Key is a node key ("TICKER:EXPIRY") if the filename contains an expiry,
+        or a plain ticker otherwise.
     """
+    from ..utils.node_key import make_node_key
+    import re
+
     _ensure_dir()
     result = {}
+    # Match patterns like SPY_prior.json or SPY_2025-04-17_prior.json
     for p in sorted(PRIORS_DIR.glob("*_prior.json")):
-        ticker = p.stem.replace("_prior", "")
+        stem = p.stem  # e.g. "SPY_prior" or "SPY_2025-04-17_prior"
+        name_part = stem.replace("_prior", "")
+        # Check if name_part ends with a date pattern YYYY-MM-DD
+        m = re.match(r"^(.+?)_(\d{4}-\d{2}-\d{2})$", name_part)
+        if m:
+            ticker = m.group(1)
+            expiry = m.group(2)
+            key = make_node_key(ticker, expiry)
+        else:
+            ticker = name_part
+            key = ticker
         try:
             with open(p, "r") as f:
                 data = json.load(f)
-            result[ticker] = {
+            result[key] = {
                 "filename": p.name,
                 "timestamp": data.get("timestamp", ""),
                 "ticker": ticker,
@@ -116,7 +132,12 @@ def save_prior(
         "bs_s": float(prior_dict.get("s", 0.0)),
     }
 
-    filename = f"{ticker}_prior.json"
+    from ..utils.node_key import is_compound_key, split_node_key
+    if is_compound_key(ticker):
+        tk, exp = split_node_key(ticker)
+        filename = f"{tk}_{exp}_prior.json"
+    else:
+        filename = f"{ticker}_prior.json"
     filepath = PRIORS_DIR / filename
     with open(filepath, "w") as f:
         json.dump(payload, f, indent=2)
@@ -137,7 +158,12 @@ def load_prior(ticker: str) -> dict:
     Raises:
         FileNotFoundError: if no saved prior exists for *ticker*.
     """
-    filepath = PRIORS_DIR / f"{ticker}_prior.json"
+    from ..utils.node_key import is_compound_key, split_node_key
+    if is_compound_key(ticker):
+        tk, exp = split_node_key(ticker)
+        filepath = PRIORS_DIR / f"{tk}_{exp}_prior.json"
+    else:
+        filepath = PRIORS_DIR / f"{ticker}_prior.json"
     if not filepath.exists():
         raise FileNotFoundError(f"No saved prior for {ticker}")
 

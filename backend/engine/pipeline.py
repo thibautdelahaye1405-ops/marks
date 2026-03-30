@@ -68,24 +68,32 @@ def run_marking(
     shock_nudges: Optional[Dict[str, float]] = None,
     calibrated_priors: Optional[Dict[str, dict]] = None,
     full_chains: Optional[Dict] = None,
+    node_keys: Optional[List[str]] = None,
 ) -> MarkingResult:
     """
-    Run the full single-maturity marking pipeline.
+    Run the marking pipeline.
+
+    Supports both single-maturity (node_keys=None, uses asset tickers)
+    and multi-expiry (node_keys provided, uses compound "TICKER:EXPIRY" keys).
 
     Args:
         assets:          universe definition
-        quotes:          market quotes per observed ticker
+        quotes:          market quotes per node key (or ticker)
         config:          engine hyperparameters
-        W_override:      optional manual W matrix
-        alpha_overrides: optional per-ticker self-trust
-        shock_nudges:    optional per-ticker ATM vol nudge (added to market shock)
+        W_override:      optional manual W matrix (must match node_keys size if provided)
+        alpha_overrides: optional per-node self-trust
+        shock_nudges:    optional per-node ATM vol nudge
+        calibrated_priors: optional per-node calibrated priors
+        full_chains:     optional per-node full chain data for display
+        node_keys:       ordered list of node identifiers (default: asset tickers)
 
     Returns:
         MarkingResult with per-node marked smiles and propagation data.
     """
-    N = len(assets)
+    # Node keys: use provided list or fall back to ticker list from assets
+    tickers = node_keys if node_keys is not None else [a.ticker for a in assets]
+    N = len(tickers)
     M = config.M
-    tickers = [a.ticker for a in assets]
 
     # Build quantile grid and basis functions
     grid = quantile_grid(config.quantile_grid_size)
@@ -110,15 +118,22 @@ def run_marking(
     observed_mask = np.array([t in quotes for t in tickers])
 
     # Compute priors for all nodes
+    # tickers may be plain ("SPY") or compound ("SPY:2026-05-15")
+    from ..utils.node_key import ticker_of
     priors = {}
-    for i, a in enumerate(assets):
-        # Use calibrated prior if available (from previous close data)
-        if calibrated_priors and a.ticker in calibrated_priors:
-            priors[a.ticker] = calibrated_priors[a.ticker]
-            continue
+    for i, node_key in enumerate(tickers):
+        tk = ticker_of(node_key)
+        # Try calibrated prior: exact key first, then plain ticker fallback
+        if calibrated_priors:
+            if node_key in calibrated_priors:
+                priors[node_key] = calibrated_priors[node_key]
+                continue
+            elif tk in calibrated_priors:
+                priors[node_key] = calibrated_priors[tk]
+                continue
 
-        if a.ticker in quotes:
-            q = quotes[a.ticker]
+        if node_key in quotes:
+            q = quotes[node_key]
             atm_iv = q.atm_iv
             T = q.T
         else:
@@ -126,7 +141,7 @@ def run_marking(
             T = list(quotes.values())[0].T
             atm_iv = avg_iv
 
-        priors[a.ticker] = bs_prior(atm_iv, T, grid)
+        priors[node_key] = bs_prior(atm_iv, T, grid)
 
     # For each observed node: compute shocks y_v and Jacobian A_v
     A_blocks = {}
@@ -419,8 +434,7 @@ def run_marking(
             filt_k, filt_iv, filt_mask = filter_quotes_for_fit(q.strikes, q.mid_ivs, q.forward)
             if len(filt_k) >= 5:
                 pt = np.array(prior_theta) if prior_theta is not None and config.lambda_prior > 0 else None
-                filt_strikes_lqd = q.forward * np.exp(filt_k)
-                lqd_res = fit_lqd_model(filt_strikes_lqd, filt_iv, q.forward, q.T,
+                lqd_res = fit_lqd_model(filt_k, filt_iv, q.forward, q.T,
                                          bid_ask_spread=q.bid_ask_spread[filt_mask] if q.bid_ask_spread is not None else None,
                                          use_bid_ask_fit=config.use_bid_ask_fit,
                                          prior_theta=pt,
@@ -518,8 +532,7 @@ def run_marking(
             filt_k, filt_iv, filt_mask = filter_quotes_for_fit(q.strikes, q.mid_ivs, q.forward)
             if len(filt_k) >= 5:
                 pp = np.array(prior_sig) if prior_sig is not None and config.lambda_prior > 0 else None
-                filt_strikes_sig = q.forward * np.exp(filt_k)
-                sig_res = fit_sigmoid_model(filt_strikes_sig, filt_iv, q.forward, q.T,
+                sig_res = fit_sigmoid_model(filt_k, filt_iv, q.forward, q.T,
                                              bid_ask_spread=q.bid_ask_spread[filt_mask] if q.bid_ask_spread is not None else None,
                                              use_bid_ask_fit=config.use_bid_ask_fit,
                                              prior_params=pp,

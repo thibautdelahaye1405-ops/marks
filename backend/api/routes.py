@@ -12,6 +12,7 @@ from .schemas import (
     NodeDistributionResponse, PriorRefitRequest,
     SavedPriorInfo, SavePriorRequest, SviOverrideRequest, FitRequest,
     UniverseSelectRequest, AddTickerRequest, CatalogResponse,
+    AvailableExpiriesResponse, ExpirySelectionRequest,
 )
 from ..data.prior_store import (
     list_saved_priors as _list_saved_priors,
@@ -24,8 +25,9 @@ from ..data.referential import (
     set_active_tickers, add_ticker as _add_ticker,
     confirm_ticker, save_selection,
 )
-from ..data.quotes import fetch_option_chain, OptionChainData, validate_ticker
+from ..data.quotes import fetch_option_chain, fetch_available_expiries, fetch_option_chains, OptionChainData, validate_ticker
 from ..data.store import save_snapshot, get_latest_snapshots
+from ..utils.node_key import make_node_key, split_node_key, is_compound_key, ticker_of, group_by_ticker, unique_tickers
 from ..engine.lqd import quantile_grid, basis_functions
 from ..engine.prior import bs_prior, fit_lqd_prior, apply_beta_overrides, compute_distribution_view
 from ..engine.graph import build_influence_matrix
@@ -36,9 +38,10 @@ from ..data.dividends import fetch_dividend_info
 router = APIRouter(prefix="/api")
 
 
-def _chain_to_snapshot(c) -> QuoteSnapshot:
+def _chain_to_snapshot(c, node_key: str = None) -> QuoteSnapshot:
     """Convert an OptionChainData to a QuoteSnapshot response."""
     return QuoteSnapshot(
+        node_key=node_key or make_node_key(c.ticker, c.expiry),
         ticker=c.ticker, expiry=c.expiry, T=c.T,
         spot=c.spot, forward=c.forward, atm_iv=c.atm_iv,
         strikes=c.strikes.tolist(), mid_ivs=c.mid_ivs.tolist(),
@@ -55,18 +58,23 @@ def _chain_to_snapshot(c) -> QuoteSnapshot:
     )
 
 # In-memory state for the current session
+# All quote/prior/solve dicts are keyed by node key (plain ticker or "TICKER:EXPIRY")
 _state = {
-    "quotes": {},       # ticker -> OptionChainData
-    "W": None,          # current influence matrix
+    "quotes": {},       # node_key -> OptionChainData
+    "W": None,          # current influence matrix (may be full tensor in multi-expiry)
     "alphas": None,     # current self-trust vector
     "config": EngineConfig(),
-    "priors_base": {},  # ticker -> immutable base prior (from calibrate-priors or fit)
-    "priors": {},       # ticker -> active prior (base + overrides, used by solve)
+    "priors_base": {},  # node_key -> immutable base prior
+    "priors": {},       # node_key -> active prior (base + overrides)
     "solve_result": None,  # last MarkingResult for distribution views
     "treasury_curve": None,  # TreasuryCurve from FRED
     "dividends": {},         # ticker -> DividendInfo
-    "forward_overrides": {},       # ticker -> absolute forward override (current smile)
-    "prev_forward_overrides": {},   # ticker -> absolute forward override (prior)
+    "forward_overrides": {},       # node_key -> absolute forward override (current smile)
+    "prev_forward_overrides": {},   # node_key -> absolute forward override (prior)
+    # Multi-expiry state
+    "selected_expiries": {},   # ticker -> [expiry_dates] (user selections)
+    "available_expiries": {},  # ticker -> [expiry_dates] (cached from Yahoo)
+    "node_keys": [],           # ordered list of active node keys
 }
 
 
@@ -89,13 +97,17 @@ def _get_rate(T: float) -> float:
 
 
 def _compute_forward(spot, T, ticker):
-    """Compute forward with full formula: S*exp((r-q-repo)*T) - PV(divs)."""
+    """Compute forward with full formula: S*exp((r-q-repo)*T) - PV(divs).
+
+    ticker can be a plain ticker or a node key ("TICKER:EXPIRY").
+    """
     import math
     config = _state["config"]
     r = _get_rate(T)
-    div_info = _state.get("dividends", {}).get(ticker)
+    tk = ticker_of(ticker)  # extract plain ticker from node key
+    div_info = _state.get("dividends", {}).get(tk)
     q = div_info.continuous_yield if div_info else 0.0
-    repo = config.repo_rate_for(ticker)
+    repo = config.repo_rate_for(tk)
     pv_divs = 0.0
     if div_info and div_info.discrete_dividends and not div_info.is_index:
         from ..data.dividends import pv_discrete_dividends
@@ -242,6 +254,29 @@ def save_universe_selection():
     return {"status": "ok", "tickers": tickers}
 
 
+@router.get("/expiries/{ticker}", response_model=AvailableExpiriesResponse)
+def get_expiries(ticker: str):
+    """Get all available option expiry dates for a ticker."""
+    from datetime import datetime
+    expiries = fetch_available_expiries(ticker)
+    T_values = [max((datetime.strptime(e, "%Y-%m-%d") - datetime.now()).days / 365.0, 1/365) for e in expiries]
+    _state["available_expiries"][ticker] = expiries
+    return AvailableExpiriesResponse(ticker=ticker, expiries=expiries, T_values=T_values)
+
+
+@router.post("/expiry-selection")
+def set_expiry_selection(req: ExpirySelectionRequest):
+    """Set which expiries to fetch for each ticker."""
+    _state["selected_expiries"] = req.selections
+    return {"status": "ok", "selections": req.selections}
+
+
+@router.get("/expiry-selection")
+def get_expiry_selection():
+    """Get current expiry selections."""
+    return {"selections": _state["selected_expiries"]}
+
+
 @router.post("/fetch-quotes", response_model=Dict[str, QuoteSnapshot])
 def fetch_quotes_endpoint():
     """Fetch fresh option chains from Yahoo Finance for the entire universe."""
@@ -260,23 +295,50 @@ def fetch_quotes_endpoint():
         dividends[asset.ticker] = fetch_dividend_info(asset.ticker, is_index=asset.is_index)
     _state["dividends"] = dividends
 
+    selected_expiries = _state.get("selected_expiries", {})
+    multi_expiry = len(selected_expiries) > 0
+
+    # Clear old quotes to avoid key format mixing
+    _state["quotes"] = {}
+    _state["priors"] = {}
+    _state["priors_base"] = {}
+
     results = {}
     for asset in universe:
-        chain = fetch_option_chain(
-            asset.ticker,
-            target_maturity_days=config.target_maturity_days,
-            rate_func=rate_func,
-            dividend_info=dividends.get(asset.ticker),
-            repo_rate=config.repo_rate_for(asset.ticker),
-        )
-        if chain is not None:
-            _state["quotes"][asset.ticker] = chain
-            save_snapshot(chain)
-            results[asset.ticker] = _chain_to_snapshot(chain)
-            confirm_ticker(asset.ticker)
+        if multi_expiry and asset.ticker in selected_expiries:
+            # Multi-expiry: fetch each selected expiry
+            chains = fetch_option_chains(
+                asset.ticker, selected_expiries[asset.ticker],
+                rate_func=rate_func,
+                dividend_info=dividends.get(asset.ticker),
+                repo_rate=config.repo_rate_for(asset.ticker),
+            )
+            for nk, chain in chains.items():
+                _state["quotes"][nk] = chain
+                save_snapshot(chain)
+                results[nk] = _chain_to_snapshot(chain, node_key=nk)
+                confirm_ticker(asset.ticker)
+        else:
+            # Single-expiry (default)
+            chain = fetch_option_chain(
+                asset.ticker,
+                target_maturity_days=config.target_maturity_days,
+                rate_func=rate_func,
+                dividend_info=dividends.get(asset.ticker),
+                repo_rate=config.repo_rate_for(asset.ticker),
+            )
+            if chain is not None:
+                nk = make_node_key(asset.ticker, chain.expiry) if multi_expiry else asset.ticker
+                _state["quotes"][nk] = chain
+                save_snapshot(chain)
+                results[nk] = _chain_to_snapshot(chain, node_key=nk)
+                confirm_ticker(asset.ticker)
 
     if not results:
         raise HTTPException(status_code=503, detail="Could not fetch any quotes")
+
+    # Update ordered node keys
+    _state["node_keys"] = list(results.keys())
 
     return results
 
@@ -285,7 +347,7 @@ def fetch_quotes_endpoint():
 def get_latest_quotes():
     """Return the latest stored quotes."""
     if _state["quotes"]:
-        return {t: _chain_to_snapshot(c) for t, c in _state["quotes"].items()}
+        return {nk: _chain_to_snapshot(c, node_key=nk) for nk, c in _state["quotes"].items()}
 
     # Try loading from DB
     tickers = [a.ticker for a in get_universe()]
@@ -384,9 +446,8 @@ def _fit_single_ticker(ticker: str, chain, prior, req: FitRequest, is_observed: 
                     prior_theta = prior.get("_lqd_theta")
                     if prior_theta is not None:
                         prior_theta = np.array(prior_theta)
-                # fit_lqd_model expects strikes, not log-moneyness
-                filt_strikes = forward * np.exp(filt_k)
-                lqd_result = fit_lqd_model(filt_strikes, filt_iv, forward, T,
+                # filt_k from filter_quotes_for_fit is actually filtered strikes
+                lqd_result = fit_lqd_model(filt_k, filt_iv, forward, T,
                                            bid_ask_spread=filt_spread,
                                            use_bid_ask_fit=req.use_bid_ask_fit,
                                            prior_theta=prior_theta,
@@ -405,9 +466,8 @@ def _fit_single_ticker(ticker: str, chain, prior, req: FitRequest, is_observed: 
                     prior_sig = prior.get("_sigmoid_params")
                     if prior_sig is not None:
                         prior_sig = np.array(prior_sig)
-                # fit_sigmoid_model expects strikes, not log-moneyness
-                filt_strikes_sig = forward * np.exp(filt_k)
-                sig_result = fit_sigmoid_model(filt_strikes_sig, filt_iv, forward, T,
+                # filt_k from filter_quotes_for_fit is actually filtered strikes
+                sig_result = fit_sigmoid_model(filt_k, filt_iv, forward, T,
                                                bid_ask_spread=filt_spread,
                                                use_bid_ask_fit=req.use_bid_ask_fit,
                                                prior_params=prior_sig,
@@ -538,50 +598,60 @@ def solve_endpoint(req: SolveRequest):
         _state["priors_base"] = copy.deepcopy(priors)
         _state["priors"] = priors
 
-    # Determine which tickers are observed
-    observed_set = set(req.observed_tickers) if req.observed_tickers else set(_state["quotes"].keys())
+    # Determine node keys and observed status
+    # observed_tickers from frontend may be plain tickers or compound keys
+    req_observed = set(req.observed_tickers) if req.observed_tickers else None
+    all_quote_keys = list(_state["quotes"].keys())
+    multi_expiry = any(is_compound_key(k) for k in all_quote_keys)
 
-    # Convert OptionChainData → NodeQuotes for observed tickers only
+    # Resolve observed set: if frontend sends plain tickers, expand to all
+    # compound keys for that ticker
+    if req_observed is not None:
+        observed_set = set()
+        for key in all_quote_keys:
+            tk = ticker_of(key)
+            if key in req_observed or tk in req_observed:
+                observed_set.add(key)
+    else:
+        observed_set = set(all_quote_keys)
+
+    # Convert OptionChainData → NodeQuotes for observed nodes
     node_quotes = {}
-    for ticker, chain in _state["quotes"].items():
-        if ticker not in observed_set:
+    for key, chain in _state["quotes"].items():
+        if key not in observed_set:
             continue
 
         strikes = chain.strikes.copy()
         mid_ivs = chain.mid_ivs.copy()
         spread = chain.bid_ask_spread.copy()
 
-        # Exclude specific quote points if requested
-        if req.excluded_quotes and ticker in req.excluded_quotes:
+        # Exclusions/additions: check both compound key and plain ticker
+        tk = ticker_of(key)
+        excl_key = key if (req.excluded_quotes and key in req.excluded_quotes) else tk
+        if req.excluded_quotes and excl_key in req.excluded_quotes:
             keep = np.ones(len(strikes), dtype=bool)
-            for idx in req.excluded_quotes[ticker]:
+            for idx in req.excluded_quotes[excl_key]:
                 if 0 <= idx < len(keep):
                     keep[idx] = False
-            n_before = len(strikes)
             strikes = strikes[keep]
             mid_ivs = mid_ivs[keep]
             spread = spread[keep]
 
-
-        # Append user-added synthetic quotes
-        if req.added_quotes and ticker in req.added_quotes:
-            for pt in req.added_quotes[ticker]:
+        add_key = key if (req.added_quotes and key in req.added_quotes) else tk
+        if req.added_quotes and add_key in req.added_quotes:
+            for pt in req.added_quotes[add_key]:
                 if len(pt) >= 2:
                     strikes = np.append(strikes, pt[0])
                     mid_ivs = np.append(mid_ivs, pt[1])
-                    # Use median spread as uncertainty for added points
                     spread = np.append(spread, np.median(spread) if len(spread) > 0 else 0.01)
-            # Re-sort by strike
             order = np.argsort(strikes)
-            strikes = strikes[order]
-            mid_ivs = mid_ivs[order]
-            spread = spread[order]
+            strikes, mid_ivs, spread = strikes[order], mid_ivs[order], spread[order]
 
         if len(strikes) < 3:
             continue
 
-        node_quotes[ticker] = NodeQuotes(
-            ticker=ticker,
+        node_quotes[key] = NodeQuotes(
+            ticker=key,
             strikes=strikes,
             mid_ivs=mid_ivs,
             bid_ask_spread=spread,
@@ -595,21 +665,93 @@ def solve_endpoint(req: SolveRequest):
     if req.W_override is not None:
         W_override = np.array(req.W_override)
 
-    # Full (unfiltered) chain data for display strike ranges
-    # Full chain data for ALL tickers (not just observed) so unobserved nodes
-    # get their own strike ranges in the display
+    # Resolve priors: ensure keys match quote keys
+    priors_resolved = {}
+    if _state["priors"]:
+        for key in all_quote_keys:
+            tk = ticker_of(key)
+            if key in _state["priors"]:
+                priors_resolved[key] = _state["priors"][key]
+            elif tk in _state["priors"]:
+                priors_resolved[key] = _state["priors"][tk]
+
+    if multi_expiry:
+        # Build node_keys in ticker-major order with uniform maturity grid
+        from ..engine.graph import build_time_kernel, build_full_tensor
+        lambda_T = getattr(req, 'lambda_T', config.lambda_T)
+        config.lambda_T = lambda_T
+
+        # Collect all unique T values and build a uniform grid
+        T_set = {}
+        for key in all_quote_keys:
+            chain = _state["quotes"][key]
+            T_set[chain.expiry] = chain.T
+        unique_expiries = sorted(T_set.keys(), key=lambda e: T_set[e])
+        T_values = np.array([T_set[e] for e in unique_expiries])
+
+        # Build node_keys: ticker-major order (all expiries for ticker 0, then ticker 1, ...)
+        tickers_ordered = []
+        for a in universe:
+            if any(ticker_of(k) == a.ticker for k in all_quote_keys):
+                tickers_ordered.append(a.ticker)
+
+        # For the Kronecker product, every ticker needs every expiry.
+        # Create node keys for the full grid, using actual data where available.
+        all_node_keys = []
+        for tk in tickers_ordered:
+            for exp in unique_expiries:
+                from ..utils.node_key import make_node_key
+                nk = make_node_key(tk, exp)
+                all_node_keys.append(nk)
+                # If this node doesn't have a quote, clone from the closest available
+                if nk not in _state["quotes"]:
+                    # Find closest available expiry for this ticker
+                    tk_keys = [k for k in all_quote_keys if ticker_of(k) == tk]
+                    if tk_keys:
+                        closest = tk_keys[0]  # use first available as placeholder
+                        node_quotes.pop(nk, None)  # ensure not in observed
+                        if nk not in priors_resolved and closest in priors_resolved:
+                            priors_resolved[nk] = priors_resolved[closest]
+
+        N_tickers = len(tickers_ordered)
+        N_mats = len(unique_expiries)
+
+        if W_override is None and N_mats > 1:
+            W_asset, alphas_asset = build_influence_matrix(universe)
+            # W_asset is for full universe, but we only have some tickers with quotes
+            # Build a sub-matrix for just the tickers that have quotes
+            asset_indices = [i for i, a in enumerate(universe) if a.ticker in tickers_ordered]
+            W_sub = W_asset[np.ix_(asset_indices, asset_indices)]
+            alphas_sub = np.array([1.0 - W_sub[i].sum() for i in range(len(asset_indices))])
+
+            K_time = build_time_kernel(T_values, lambda_T)
+            W_override, _ = build_full_tensor(W_sub, K_time, alphas_sub)
+        elif W_override is None:
+            W_asset, _ = build_influence_matrix(universe)
+            asset_indices = [i for i, a in enumerate(universe) if a.ticker in tickers_ordered]
+            W_override = W_asset[np.ix_(asset_indices, asset_indices)]
+    else:
+        all_node_keys = []
+
+    # Full chain data for display
     full_chains = dict(_state["quotes"])
 
-    result = run_marking(
-        assets=universe,
-        quotes=node_quotes,
-        config=config,
-        W_override=W_override,
-        alpha_overrides=req.alpha_overrides,
-        shock_nudges=req.shock_nudges,
-        calibrated_priors=_state["priors"] if _state["priors"] else None,
-        full_chains=full_chains,
-    )
+    try:
+        result = run_marking(
+            assets=universe,
+            quotes=node_quotes,
+            config=config,
+            W_override=W_override,
+            alpha_overrides=req.alpha_overrides,
+            shock_nudges=req.shock_nudges,
+            calibrated_priors=priors_resolved if priors_resolved else None,
+            full_chains=full_chains,
+            node_keys=all_node_keys if multi_expiry else None,
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Marking engine error: {e}")
 
     # Cache results
     _state["W"] = result.W
@@ -650,19 +792,72 @@ def solve_endpoint(req: SolveRequest):
     )
 
 
+@router.get("/time-kernel")
+def get_time_kernel(lambda_T: float = None):
+    """Return the cross-maturity influence kernel K_time.
+
+    Uses T values from loaded quotes. Returns the kernel matrix,
+    maturity labels, and T values.
+    """
+    from ..engine.graph import build_time_kernel
+
+    config = _state["config"]
+    lt = lambda_T if lambda_T is not None else config.lambda_T
+
+    # Collect unique T values from quotes
+    T_map = {}  # expiry -> T
+    for key, chain in _state["quotes"].items():
+        T_map[chain.expiry] = chain.T
+
+    if len(T_map) <= 1:
+        # Single maturity: return trivial 1x1 kernel
+        expiries = list(T_map.keys()) or [""]
+        T_values = list(T_map.values()) or [0.08]
+        return {
+            "K": [[1.0]],
+            "expiries": expiries,
+            "T_values": T_values,
+            "labels": [f"{int(t*365)}d" for t in T_values],
+            "lambda_T": lt,
+        }
+
+    # Sort by T
+    sorted_items = sorted(T_map.items(), key=lambda x: x[1])
+    expiries = [e for e, _ in sorted_items]
+    T_values = [t for _, t in sorted_items]
+    T_arr = np.array(T_values)
+
+    K = build_time_kernel(T_arr, lt)
+
+    return {
+        "K": K.tolist(),
+        "expiries": expiries,
+        "T_values": T_values,
+        "labels": [f"{int(t*365)}d" for t in T_values],
+        "lambda_T": lt,
+    }
+
+
 @router.get("/graph", response_model=GraphData)
 def get_graph():
-    """Return the current influence graph."""
+    """Return the current influence graph.
+
+    In multi-expiry mode, returns the full tensor with node keys.
+    In single-maturity mode, returns the asset-only graph with ticker keys.
+    """
     universe = get_universe()
-    tickers = [a.ticker for a in universe]
+    all_quote_keys = list(_state.get("quotes", {}).keys())
+    multi_expiry = any(is_compound_key(k) for k in all_quote_keys)
 
     if _state["W"] is None:
         W, alphas = build_influence_matrix(universe)
         _state["W"] = W
         _state["alphas"] = alphas
 
+    graph_tickers = all_quote_keys if multi_expiry else [a.ticker for a in universe]
+
     return GraphData(
-        tickers=tickers,
+        tickers=graph_tickers,
         W=_state["W"].tolist(),
         alphas=_state["alphas"].tolist(),
         assets=[
