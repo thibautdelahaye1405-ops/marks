@@ -51,23 +51,45 @@ export default function FetchPriorsModal({ isOpen, onClose }: Props) {
   const handleExecute = async () => {
     setRunning(true);
     try {
-      // Step 1: Fetch quotes for all non-skipped tickers (needed for both "fetch" and "file")
-      const fetchTickers = universe
-        .map((a) => a.ticker)
-        .filter((t) => choices[t] !== "skip");
+      // Step 1: Fetch quotes — needed for chains (both "fetch" and "file" need chain data)
+      const needsFetch = universe.some((a) => choices[a.ticker] === "fetch");
+      const needsAnyQuotes = universe.some((a) => choices[a.ticker] !== "skip");
 
-      if (fetchTickers.length > 0) {
+      if (needsAnyQuotes) {
         setProgress("Fetching market data...");
-        const quotes = await api.fetchQuotes();
-        useEngine.setState({
-          quotes,
-          observedTickers: Object.keys(quotes),
-          excludedQuotes: {},
-          excludedPriorQuotes: {},
-          addedQuotes: {},
-          addedPriorQuotes: {},
-          solveResult: null,
-        });
+        let quotes: Record<string, any> | null = null;
+        if (needsFetch) {
+          // Try live fetch first
+          try {
+            quotes = await api.fetchQuotes();
+          } catch {
+            // Live fetch failed — fall back to cached quotes
+            setProgress("Live fetch failed, using cached data...");
+            try {
+              quotes = await api.getLatestQuotes();
+            } catch {
+              quotes = null;
+            }
+          }
+        } else {
+          // All sources are "file" or "skip" — just load cached quotes
+          try {
+            quotes = await api.getLatestQuotes();
+          } catch {
+            quotes = null;
+          }
+        }
+        if (quotes && Object.keys(quotes).length > 0) {
+          useEngine.setState({
+            quotes,
+            observedTickers: Object.keys(quotes),
+            excludedQuotes: {},
+            excludedPriorQuotes: {},
+            addedQuotes: {},
+            addedPriorQuotes: {},
+            solveResult: null,
+          });
+        }
       }
 
       // Step 2: Load saved priors for "file" tickers and restore their markers

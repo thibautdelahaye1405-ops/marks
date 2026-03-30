@@ -16,15 +16,31 @@ export default function ControlPanel({
     error,
     quotes,
     priorsCalibrated,
+    computing,
     fetchSnapshot,
     calibrateAllPriors,
     fitAllSnapshots,
   } = useEngine();
 
   const hasQuotes = Object.keys(quotes).length > 0;
+  const busy = computing > 0 || loading;
 
   return (
     <div style={barStyle}>
+      {/* Status light */}
+      <div
+        title={busy ? "Computing..." : "Idle"}
+        style={{
+          width: 8,
+          height: 8,
+          borderRadius: "50%",
+          background: busy ? "#f59e0b" : "#22c55e",
+          boxShadow: busy ? "0 0 6px #f59e0b" : "0 0 4px #22c55e",
+          flexShrink: 0,
+          transition: "background 0.3s, box-shadow 0.3s",
+        }}
+      />
+
       {/* Fetch buttons */}
       <button onClick={onFetchPriors} disabled={loading} style={btnStyle}>
         {loading ? "..." : "Fetch Priors"}

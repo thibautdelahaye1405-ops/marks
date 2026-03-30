@@ -384,7 +384,9 @@ def _fit_single_ticker(ticker: str, chain, prior, req: FitRequest, is_observed: 
                     prior_theta = prior.get("_lqd_theta")
                     if prior_theta is not None:
                         prior_theta = np.array(prior_theta)
-                lqd_result = fit_lqd_model(filt_k, filt_iv, forward, T,
+                # fit_lqd_model expects strikes, not log-moneyness
+                filt_strikes = forward * np.exp(filt_k)
+                lqd_result = fit_lqd_model(filt_strikes, filt_iv, forward, T,
                                            bid_ask_spread=filt_spread,
                                            use_bid_ask_fit=req.use_bid_ask_fit,
                                            prior_theta=prior_theta,
@@ -396,6 +398,25 @@ def _fit_single_ticker(ticker: str, chain, prior, req: FitRequest, is_observed: 
                 # pad to match expected length if needed
                 if len(svi_beta) < 6:
                     svi_beta.extend([0.0] * (6 - len(svi_beta)))
+            elif smile_model == "sigmoid":
+                from ..engine.sigmoid import fit_sigmoid_model, sigmoid_iv_at_strikes
+                prior_sig = None
+                if prior and req.lambda_prior > 0:
+                    prior_sig = prior.get("_sigmoid_params")
+                    if prior_sig is not None:
+                        prior_sig = np.array(prior_sig)
+                # fit_sigmoid_model expects strikes, not log-moneyness
+                filt_strikes_sig = forward * np.exp(filt_k)
+                sig_result = fit_sigmoid_model(filt_strikes_sig, filt_iv, forward, T,
+                                               bid_ask_spread=filt_spread,
+                                               use_bid_ask_fit=req.use_bid_ask_fit,
+                                               prior_params=prior_sig,
+                                               lambda_prior=req.lambda_prior,
+                                               atm_iv=chain.atm_iv)
+                sig_ref = sig_result["sigma_ref"]
+                iv_marked = sigmoid_iv_at_strikes(sig_result["params"], strikes, forward, T, sig_ref)
+                iv_marked = np.clip(np.where(np.isfinite(iv_marked), iv_marked, chain.atm_iv), 0.01, 5.0)
+                svi_beta = sig_result["params"].tolist()
         else:
             iv_marked = iv_prior.copy()
             svi_beta = [0.04, 0.0, 0.5, 0.5, 1.0]
@@ -734,6 +755,29 @@ def _calibrate_single_prior(ticker: str, chain, config, grid, phi, smile_model: 
         except Exception:
             pass  # LQD overlay failed; base prior remains valid
 
+    elif smile_model == "sigmoid":
+        try:
+            from ..engine.sigmoid import fit_sigmoid_model
+
+            ivs = chain.prev_close_ivs if chain.prev_close_ivs is not None else chain.mid_ivs
+            fwd = _effective_prev_forward(ticker) if chain.prev_close_ivs is not None else chain.forward
+            atm_idx = np.argmin(np.abs(np.log(chain.strikes / fwd)))
+
+            sig_result = fit_sigmoid_model(
+                chain.strikes, ivs, fwd, chain.T,
+                atm_iv=float(ivs[atm_idx]),
+            )
+            prior["_sigmoid_params"] = sig_result["params"].tolist()
+            prior["_sigmoid_sigma_ref"] = sig_result["sigma_ref"]
+
+            # Also fit SVI for fallback IV evaluation
+            filt_k, filt_iv, _ = filter_quotes_for_fit(chain.strikes, ivs, fwd)
+            if len(filt_k) >= 5:
+                svi_result = fit_svi(filt_k, filt_iv, fwd, chain.T)
+                prior["_svi_params"] = svi_result
+        except Exception:
+            pass
+
     return prior
 
 
@@ -803,8 +847,11 @@ def get_prior(ticker: str, smile_model: str = None):
     view = compute_distribution_view(prior, grid, forward, T, _get_rate(T), phi=phi, market_strikes=chain.strikes if chain else None)
 
     # Return model params as "beta" for the slider UI
+    sigmoid_params = prior.get("_sigmoid_params")
     lqd_theta = prior.get("_lqd_theta")
-    if lqd_theta is not None and effective_model == "lqd":
+    if sigmoid_params is not None and effective_model == "sigmoid":
+        beta = list(sigmoid_params)
+    elif lqd_theta is not None and effective_model == "lqd":
         beta = list(lqd_theta)
     else:
         jw = prior.get("_jw_params")
@@ -1051,6 +1098,76 @@ def lqd_override_smile(ticker: str, req: dict):
         "iv_prior": [float(v) if np.isfinite(v) else None for v in iv_prior],
         "iv_marked": [float(v) if np.isfinite(v) else None for v in iv_marked],
         "beta": theta.tolist(),
+        "is_observed": True,
+    }
+
+
+@router.post("/prior/{ticker}/sigmoid-override", response_model=DistributionView)
+def sigmoid_override_prior(ticker: str, req: dict):
+    """Override the prior Sigmoid params and return updated distribution view."""
+    config = _state["config"]
+    grid = quantile_grid(config.quantile_grid_size)
+    phi = basis_functions(grid, config.M)
+
+    base_prior = _state["priors_base"].get(ticker) or _state["priors"].get(ticker)
+    if base_prior is None:
+        raise HTTPException(status_code=404, detail=f"No prior for {ticker}")
+
+    chain = _state["quotes"].get(ticker)
+    forward = chain.forward if chain else 100.0
+    T = chain.T if chain else 30 / 365
+
+    params = np.array(req.get("params", [0.25, 0.0, 0.01, 0.02, 0.02, 0.20]), dtype=float)
+    sigma_ref = base_prior.get("_sigmoid_sigma_ref", chain.atm_iv if chain else 0.25)
+
+    updated = {**base_prior, "_sigmoid_params": params.tolist(), "_sigmoid_sigma_ref": float(sigma_ref)}
+    _state["priors"][ticker] = updated
+
+    view = compute_distribution_view(updated, grid, forward, T, _get_rate(T), phi=phi,
+                                     market_strikes=chain.strikes if chain else None)
+    return DistributionView(
+        moneyness=view["moneyness"], iv_curve=view["iv_curve"],
+        cdf_x=view["cdf_x"], cdf_y=view["cdf_y"],
+        lqd_u=view["lqd_u"], lqd_psi=view["lqd_psi"],
+        fit_forward=view.get("fit_forward"),
+        beta=params.tolist(),
+    )
+
+
+@router.post("/smile/{ticker}/sigmoid-override")
+def sigmoid_override_smile(ticker: str, req: dict):
+    """Evaluate a smile with given Sigmoid trader params at display strikes."""
+    chain = _state["quotes"].get(ticker)
+    if chain is None:
+        raise HTTPException(status_code=404, detail=f"No quotes for {ticker}")
+
+    from ..engine.sigmoid import sigmoid_iv_at_strikes
+
+    params = np.array(req.get("params", [0.25, 0.0, 0.01, 0.02, 0.02, 0.20]), dtype=float)
+    forward = chain.forward
+    T = chain.T
+    sigma_ref = chain.atm_iv
+
+    iv_marked = sigmoid_iv_at_strikes(params, chain.strikes, forward, T, sigma_ref)
+    iv_marked = np.where(np.isfinite(iv_marked), iv_marked, chain.atm_iv)
+    iv_marked = np.clip(iv_marked, 0.01, 5.0)
+
+    # Prior for comparison
+    prior = _state["priors"].get(ticker)
+    svi_prior = prior.get("_svi_params") if prior else None
+    if svi_prior:
+        from ..engine.svi import svi_iv_at_strikes as svi_eval
+        iv_prior = svi_eval(svi_prior, chain.strikes, forward, T)
+        iv_prior = np.clip(iv_prior, 0.01, 5.0)
+    else:
+        iv_prior = iv_marked.copy()
+
+    return {
+        "ticker": ticker,
+        "strikes": chain.strikes.tolist(),
+        "iv_prior": [float(v) if np.isfinite(v) else None for v in iv_prior],
+        "iv_marked": [float(v) if np.isfinite(v) else None for v in iv_marked],
+        "beta": params.tolist(),
         "is_observed": True,
     }
 

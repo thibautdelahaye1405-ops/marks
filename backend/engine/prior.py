@@ -354,11 +354,25 @@ def compute_distribution_view(
     moneyness = np.linspace(m_lo, m_hi, n_moneyness)
     strikes = forward * np.exp(moneyness)
 
+    sigmoid_params = prior_dict.get("_sigmoid_params")
+    sigmoid_sigma_ref = prior_dict.get("_sigmoid_sigma_ref")
     lqd_theta = prior_dict.get("_lqd_theta")
     lqd_alpha = prior_dict.get("_lqd_alpha")
     svi_params = prior_dict.get("_svi_params")
 
-    if lqd_theta is not None and lqd_alpha is not None:
+    if sigmoid_params is not None and sigmoid_sigma_ref is not None:
+        # Sigmoid model: IV from closed-form, CDF/LQD via Breeden-Litzenberger
+        from .sigmoid import sigmoid_iv_at_strikes, sigmoid_to_cdf_lqd
+        params = np.asarray(sigmoid_params, dtype=float)
+        sr = float(sigmoid_sigma_ref)
+        iv_curve = sigmoid_iv_at_strikes(params, strikes, forward, T, sr)
+        iv_curve = np.where(np.isfinite(iv_curve), iv_curve, 0.25)
+        iv_curve = np.clip(iv_curve, 0.01, 5.0)
+        sig_dist = sigmoid_to_cdf_lqd(params, sr, forward, T, r, grid)
+        cdf_x = sig_dist["cdf_x"]
+        cdf_y = sig_dist["cdf_y"]
+        lqd_psi = sig_dist["psi"]
+    elif lqd_theta is not None and lqd_alpha is not None:
         # LQD model: derive IV, CDF, LQD natively from the quantile
         from .lqd import (evaluate_lqd, reconstruct_quantile,
                           basis_functions as lqd_basis, quantile_grid as lqd_grid,

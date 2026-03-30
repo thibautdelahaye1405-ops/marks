@@ -38,8 +38,11 @@ interface EngineState {
   addedPriorQuotes: Record<string, [number, number][]>; // ticker -> [[strike, iv], ...]
 
   // Smile model
-  smileModel: string;  // "svi" | "lqd"
+  smileModel: string;  // "svi" | "lqd" | "sigmoid"
   setSmileModel: (model: string) => void;
+
+  // Computation tracking
+  computing: number;  // >0 means background work in progress
 
   // Prior state
   priorsCalibrated: boolean;
@@ -56,6 +59,7 @@ interface EngineState {
   addTicker: (ticker: string, name?: string, sector?: string) => Promise<void>;
   fetchPriors: () => Promise<void>;
   fetchSnapshot: () => Promise<void>;
+  restoreQuotes: () => Promise<void>;
   fit: () => Promise<void>;       // lightweight: SVI for observed, prior for unobserved
   propagate: () => Promise<void>;  // full: graph propagation (only via Propagate button)
   fetchGraph: () => Promise<void>;
@@ -118,6 +122,7 @@ export const useEngine = create<EngineState>((set, get) => ({
   addedQuotes: {},
   addedPriorQuotes: {},
   smileModel: "svi",
+  computing: 0,
   priorsCalibrated: false,
   priorsVersion: 0,
   universeUnsaved: false,
@@ -215,6 +220,23 @@ export const useEngine = create<EngineState>((set, get) => ({
     }
   },
 
+  restoreQuotes: async () => {
+    // Restore cached quotes from backend on page load / hot-reload
+    try {
+      const quotes = await api.getLatestQuotes();
+      if (Object.keys(quotes).length > 0) {
+        const { observedTickers } = get();
+        const tickers = Object.keys(quotes);
+        const kept = observedTickers.length > 0
+          ? observedTickers.filter((t) => tickers.includes(t))
+          : tickers;
+        set({ quotes, observedTickers: kept });
+      }
+    } catch {
+      // Silently ignore — quotes will be empty until user fetches
+    }
+  },
+
   fetchSnapshot: async () => {
     set({ loading: true, error: null });
     try {
@@ -275,12 +297,12 @@ export const useEngine = create<EngineState>((set, get) => ({
 
   calibrateAllPriors: async () => {
     const { smileModel } = get();
-    set({ loading: true, error: null });
+    set((s) => ({ loading: true, error: null, computing: s.computing + 1 }));
     try {
       await api.calibratePriors(smileModel);
-      set({ priorsCalibrated: true, loading: false });
+      set((s) => ({ priorsCalibrated: true, loading: false, priorsVersion: s.priorsVersion + 1, computing: s.computing - 1 }));
     } catch (e: any) {
-      set({ error: e.message, loading: false });
+      set((s) => ({ error: e.message, loading: false, computing: s.computing - 1 }));
     }
   },
 
@@ -296,6 +318,7 @@ export const useEngine = create<EngineState>((set, get) => ({
 
   fitSingleAsset: async (ticker: string) => {
     const { excludedQuotes, addedQuotes, lambdaPrior, useBidAskFit, smileModel } = get();
+    set((s) => ({ computing: s.computing + 1 }));
     try {
       const excl = excludedQuotes[ticker] ? { [ticker]: excludedQuotes[ticker] } : null;
       const added = addedQuotes[ticker] ? { [ticker]: addedQuotes[ticker] } : null;
@@ -314,19 +337,22 @@ export const useEngine = create<EngineState>((set, get) => ({
             ...(s.solveResult ?? { W: [], alphas: [], tickers: Object.keys(nodes), propagation_matrix: null, neumann_terms: null, influence_scores: null, wasserstein_distances: null }),
             nodes,
           },
+          computing: s.computing - 1,
         };
       });
     } catch (e: any) {
-      set({ error: e.message });
+      set((s) => ({ error: e.message, computing: s.computing - 1 }));
     }
   },
 
   calibrateSinglePrior: async (ticker: string) => {
     const { smileModel } = get();
+    set((s) => ({ computing: s.computing + 1 }));
     try {
       await api.calibrateSinglePrior(ticker, smileModel);
+      set((s) => ({ priorsVersion: s.priorsVersion + 1, computing: s.computing - 1 }));
     } catch (e: any) {
-      set({ error: e.message });
+      set((s) => ({ error: e.message, computing: s.computing - 1 }));
     }
   },
 

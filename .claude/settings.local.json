@@ -20,7 +20,21 @@
       "Bash(gh auth:*)",
       "Bash(cmd.exe /c \"gh auth status\" 2>&1)",
       "Bash(git:*)",
-      "Bash(cmd.exe /c \"where gh\" 2>&1)"
+      "Bash(cmd.exe /c \"where gh\" 2>&1)",
+      "Bash(xargs wc:*)",
+      "Bash(grep -r \"next\\\\|Next\\\\|NEXT\" /c/Users/thiba/marks --include=*.py --include=*.ts --include=*.tsx)",
+      "Bash(grep:*)",
+      "Bash(pip show:*)",
+      "Bash(find /c/Users/thiba/marks/backend -name \"__pycache__\" -type d -exec rm -rf {} +)",
+      "Bash(find /c/Users/thiba/marks/backend -name \"*.pyc\" -delete)",
+      "Bash(find backend:*)",
+      "Bash(find /c/Users/thiba/marks/frontend/src -type f \\\\\\(-name *.tsx -o -name *.ts -o -name *.jsx -o -name *.js \\\\\\))",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5000/api/quotes/latest)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -X POST http://localhost:5000/api/fetch-quotes)",
+      "Bash(curl -s -X POST http://localhost:5000/api/fetch-quotes)",
+      "Bash(curl -s http://localhost:5000/api/quotes/latest)",
+      "Bash(curl -s -X POST \"http://localhost:5000/api/calibrate-prior/SPY?smile_model=sigmoid\")",
+      "Bash(curl -s \"http://localhost:5000/api/prior/SPY?smile_model=sigmoid\")"
     ]
   }
 }

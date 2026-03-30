@@ -235,15 +235,16 @@ export default function ModellingOptionsPanel() {
             />
             <span style={{ color: "#e2e8f0" }}>LQD</span>
           </label>
-          <label style={{ ...radioLabel, opacity: 0.4 }}>
+          <label style={radioLabel}>
             <input
               type="radio"
               name="smileModel"
               value="sigmoid"
-              disabled
+              checked={smileModel === "sigmoid"}
+              onChange={() => setSmileModel("sigmoid")}
               style={radioStyle}
             />
-            <span style={{ color: "#94a3b8" }}>Sigmoid</span>
+            <span style={{ color: "#e2e8f0" }}>Sigmoid</span>
           </label>
         </div>
       </div>

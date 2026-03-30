@@ -6,6 +6,8 @@ import SmileView from "./SmileView";
 import SviSliders from "./SviSliders";
 import LqdSliders from "./LqdSliders";
 import type { LqdTraderParams } from "./LqdSliders";
+import SigmoidSliders from "./SigmoidSliders";
+import type { SigmoidTraderParams } from "./SigmoidSliders";
 import type { NodeDistributionResponse, SmileData, QuoteSnapshot } from "../types";
 
 type ViewMode = "smile" | "distributions";
@@ -96,6 +98,18 @@ export default function ObservedNodeView({ ticker, smileData, quoteData }: Props
                 onChange={(params) => {
                   const theta = [params.min_iv, params.atm_skew, params.atm_curv, params.put_slope, params.call_slope, params.shoulder];
                   api.lqdOverrideSmile(ticker, theta).catch(() => {});
+                }}
+              />
+            </div>
+          )}
+          {smileData?.is_observed && smileData.beta && smileModel === "sigmoid" && smileData.beta.length >= 6 && (
+            <div style={{ borderTop: "1px solid #334155", marginTop: 8, paddingTop: 8 }}>
+              <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>Sigmoid Parameters</div>
+              <SigmoidSliders
+                values={{ sigma_atm: smileData.beta[0], s_atm: smileData.beta[1], k_atm: smileData.beta[2], w_p: smileData.beta[3], w_c: smileData.beta[4], sigma_min: smileData.beta[5] }}
+                onChange={(params) => {
+                  const p = [params.sigma_atm, params.s_atm, params.k_atm, params.w_p, params.w_c, params.sigma_min];
+                  api.sigmoidOverrideSmile(ticker, p).catch(() => {});
                 }}
               />
             </div>

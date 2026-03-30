@@ -135,6 +135,18 @@ export const api = {
       body: JSON.stringify({ theta }),
     }),
 
+  sigmoidOverrideSmile: (ticker: string, params: number[]) =>
+    request<SmileData>(`/smile/${ticker}/sigmoid-override`, {
+      method: "POST",
+      body: JSON.stringify({ params }),
+    }),
+
+  sigmoidOverridePrior: (ticker: string, params: number[]) =>
+    request<DistributionView>(`/prior/${ticker}/sigmoid-override`, {
+      method: "POST",
+      body: JSON.stringify({ params }),
+    }),
+
   // Prior save/load
   listSavedPriors: () =>
     request<Record<string, { ticker: string; filename: string; timestamp: string }>>(

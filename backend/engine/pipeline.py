@@ -212,251 +212,421 @@ def run_marking(
         beta_O = beta_all[parts["obs_idx"]]
         neumann = neumann_series_terms(parts["W_UU"], parts["W_UO"], beta_O, n_terms=5)
 
-    # Reconstruct marked smiles
-    # Observed nodes: direct SVI fit to market quotes
-    # Unobserved nodes: prior SVI + propagated SVI deltas from observed nodes
-    # --- SVI-JW Normalized Propagation ---
-    # Encoding scheme:
-    #   v (ATM var):     ln(v_mkt / v_prior)           — log-ratio (level channel)
-    #   psi_hat (skew):  (psi_mkt - psi_prior) / ref   — clamped-reference (signed param)
-    #   p_hat (put wing): ln(p_mkt / p_prior)           — log-ratio
-    #   c_hat (call wing): ln(c_mkt / c_prior)          — log-ratio
-    #   vt_ratio (min-var ratio): ln(vtr_mkt / vtr_prior) — log-ratio
-    #
-    # Two propagation channels through same P matrix:
-    #   Channel 0: level (v only)
-    #   Channel 1-4: shape (psi_hat, p_hat, c_hat, vt_ratio)
+    # ===================================================================
+    # Model-dispatched propagation
+    # ===================================================================
+    # Each model provides encode/decode/fit/eval for its param space.
+    # The propagation matrix P is model-independent (same graph structure).
+    # ===================================================================
 
-    from .svi import (svi_iv_at_strikes, svi_implied_vol, fit_svi, filter_quotes_for_fit,
-                      raw_svi_to_jw_normalized, jw_normalized_to_raw_svi)
+    smile_model = config.smile_model
 
-    JW_KEYS = ["v", "psi_hat", "p_hat", "c_hat", "vt_ratio"]
-    # Skew threshold: below this |psi_hat|, encoding switches from relative to absolute
+    # --- Shared constants ---
     SKEW_EPS = 0.1
-    # Log-ratio cap (prevents extreme propagation)
     LOG_CAP = 2.0
 
-    def _jw_encode(market_jw: dict, prior_jw: dict) -> np.ndarray:
-        """Encode market-vs-prior change in normalized JW propagation space.
+    def _log_encode(mkt, pri):
+        return np.clip(np.log(max(mkt, 1e-10) / max(pri, 1e-10)), -LOG_CAP, LOG_CAP)
 
-        Log-ratio for positive params (v, p_hat, c_hat, vt_ratio).
-        Clamped-reference for signed params (psi_hat).
-        """
-        g = np.zeros(5)
-        # v: log-ratio
-        g[0] = np.clip(np.log(max(market_jw["v"], 1e-10) / max(prior_jw["v"], 1e-10)),
-                        -LOG_CAP, LOG_CAP)
-        # psi_hat: clamped-reference encoding
-        ref = max(abs(prior_jw["psi_hat"]), SKEW_EPS)
-        g[1] = np.clip((market_jw["psi_hat"] - prior_jw["psi_hat"]) / ref,
-                        -LOG_CAP, LOG_CAP)
-        # p_hat: log-ratio
-        g[2] = np.clip(np.log(max(market_jw["p_hat"], 1e-10) / max(prior_jw["p_hat"], 1e-10)),
-                        -LOG_CAP, LOG_CAP)
-        # c_hat: log-ratio
-        g[3] = np.clip(np.log(max(market_jw["c_hat"], 1e-10) / max(prior_jw["c_hat"], 1e-10)),
-                        -LOG_CAP, LOG_CAP)
-        # vt_ratio: log-ratio
-        g[4] = np.clip(np.log(max(market_jw["vt_ratio"], 1e-10) / max(prior_jw["vt_ratio"], 1e-10)),
-                        -LOG_CAP, LOG_CAP)
-        return g
+    def _log_decode(pri, g):
+        return max(pri * np.exp(np.clip(g, -LOG_CAP, LOG_CAP)), 1e-10)
 
-    def _jw_decode(prior_jw: dict, g: np.ndarray, T: float) -> dict:
-        """Apply propagated JW change vector to a prior → new raw SVI params.
+    def _ref_encode(mkt, pri, eps=SKEW_EPS):
+        ref = max(abs(pri), eps)
+        return np.clip((mkt - pri) / ref, -LOG_CAP, LOG_CAP)
 
-        Decodes from propagation space, converts back to raw SVI.
-        """
-        g = np.clip(g, -LOG_CAP, LOG_CAP)
+    def _ref_decode(pri, g, eps=SKEW_EPS):
+        ref = max(abs(pri), eps)
+        return pri + ref * np.clip(g, -LOG_CAP, LOG_CAP)
 
-        # v: exp decode
-        v_new = prior_jw["v"] * np.exp(g[0])
-        v_new = max(v_new, 1e-8)
-
-        # psi_hat: clamped-reference decode
-        ref = max(abs(prior_jw["psi_hat"]), SKEW_EPS)
-        psi_new = prior_jw["psi_hat"] + ref * g[1]
-
-        # p_hat: exp decode
-        p_new = prior_jw["p_hat"] * np.exp(g[2])
-        p_new = max(p_new, 1e-6)
-
-        # c_hat: exp decode
-        c_new = prior_jw["c_hat"] * np.exp(g[3])
-        c_new = max(c_new, 1e-6)
-
-        # vt_ratio: exp decode, clamp to [0, 1]
-        vtr_new = prior_jw["vt_ratio"] * np.exp(g[4])
-        vtr_new = float(np.clip(vtr_new, 0.0, 1.0))
-
-        # Convert back to raw SVI
-        raw = jw_normalized_to_raw_svi(v_new, vtr_new, psi_new, p_new, c_new, T)
-        return raw
-
-    # --- Phase A: fit SVI for observed nodes, convert to JW, encode changes ---
-    obs_jw_encoded = {}   # ticker -> np.array(5,) in JW propagation space
-    obs_svi_fitted = {}   # ticker -> dict (full SVI params)
-    obs_jw_fitted = {}    # ticker -> dict (JW params)
-
-    for v_idx, ticker in enumerate(tickers):
-        if ticker not in quotes:
-            continue
-        q = quotes[ticker]
-        p = priors[ticker]
-        svi_prior = p.get("_svi_params")
-
-        filt_k, filt_iv, filt_mask = filter_quotes_for_fit(q.strikes, q.mid_ivs, q.forward)
-        if len(filt_k) >= 5:
-            # Build fit kwargs from config
-            fit_kw = dict(
-                bid_ask_spread=q.bid_ask_spread[filt_mask] if q.bid_ask_spread is not None else None,
-                use_bid_ask_fit=config.use_bid_ask_fit,
-                lambda_prior=config.lambda_prior,
-            )
-            if svi_prior and config.lambda_prior > 0:
-                fit_kw["prior_params"] = np.array([svi_prior["a"], svi_prior["b"],
-                                                    svi_prior["rho"], svi_prior["m"],
-                                                    svi_prior["sigma"]])
-            market_svi = fit_svi(filt_k, filt_iv, q.forward, q.T, **fit_kw)
-            obs_svi_fitted[ticker] = market_svi
-
-            # Convert both market and prior to normalized JW
-            market_jw = raw_svi_to_jw_normalized(
-                market_svi["a"], market_svi["b"], market_svi["rho"],
-                market_svi["m"], market_svi["sigma"], q.T)
-            obs_jw_fitted[ticker] = market_jw
-
-            if svi_prior:
-                prior_jw = raw_svi_to_jw_normalized(
-                    svi_prior["a"], svi_prior["b"], svi_prior["rho"],
-                    svi_prior["m"], svi_prior["sigma"],
-                    svi_prior.get("T", q.T))
-                # Store JW on prior for decode phase
-                p["_jw_params"] = prior_jw
-                obs_jw_encoded[ticker] = _jw_encode(market_jw, prior_jw)
-            else:
-                # No prior SVI — encode against flat prior
-                flat_jw = {"v": market_jw["v"], "vt_ratio": 1.0,
-                           "psi_hat": 0.0, "p_hat": 0.5, "c_hat": 0.5}
-                p["_jw_params"] = flat_jw
-                obs_jw_encoded[ticker] = _jw_encode(market_jw, flat_jw)
-
-    # --- Phase B: propagate JW-encoded changes to unobserved nodes ---
-    unobs_jw_propagated = {}  # ticker -> np.array(5,) in JW propagation space
-    if P is not None and len(parts["unobs_idx"]) > 0 and len(parts["obs_idx"]) > 0:
-        obs_tickers_ordered = [tickers[i] for i in parts["obs_idx"]]
-        unobs_tickers_ordered = [tickers[i] for i in parts["unobs_idx"]]
-
-        # Stack encoded changes matching P's column order
-        g_O = np.zeros((len(obs_tickers_ordered), 5))
-        for j, t in enumerate(obs_tickers_ordered):
-            if t in obs_jw_encoded:
-                g_O[j] = obs_jw_encoded[t]
-
-        # Propagate: g_U = P @ g_O  (shape: N_unobs x 5)
-        g_U = P @ g_O
-
-        for i, t in enumerate(unobs_tickers_ordered):
-            unobs_jw_propagated[t] = g_U[i]
-
-    # --- Phase C: build display smiles ---
-    nodes = {}
-    for v_idx, ticker in enumerate(tickers):
+    # --- Helper: display strike range ---
+    def _display_strikes(ticker):
+        chain = full_chains.get(ticker) if full_chains else None
         q = quotes.get(ticker)
         p = priors[ticker]
-        bs_base = p.get("_bs_base", p)
         svi_params = p.get("_svi_params")
-
-        # Display strike range from full chain
-        chain = full_chains.get(ticker) if full_chains else None
         if chain is not None:
-            strikes = chain.strikes
-            forward = chain.forward
-            T = chain.T
+            return chain.strikes, chain.forward, chain.T
         elif q is not None:
-            strikes = q.strikes
-            forward = q.forward
-            T = q.T
+            return q.strikes, q.forward, q.T
         elif svi_params and svi_params.get("forward"):
-            forward = svi_params["forward"]
-            T = svi_params.get("T", 30 / 365)
-            strikes = forward * np.exp(np.linspace(-0.08, 0.08, 30))
+            fwd = svi_params["forward"]
+            t = svi_params.get("T", 30 / 365)
+            return fwd * np.exp(np.linspace(-0.08, 0.08, 30)), fwd, t
         else:
             ref_q = list(quotes.values())[0] if quotes else None
-            forward = ref_q.spot if ref_q else 100.0
-            T = ref_q.T if ref_q else 30 / 365
-            strikes = forward * np.exp(np.linspace(-0.06, 0.06, 25))
+            fwd = ref_q.spot if ref_q else 100.0
+            t = ref_q.T if ref_q else 30 / 365
+            return fwd * np.exp(np.linspace(-0.06, 0.06, 25)), fwd, t
 
-        # Prior IVs
-        if svi_params is not None:
-            iv_prior_fitted = svi_iv_at_strikes(svi_params, strikes, forward, T)
-        else:
-            iv_prior_fitted = call_price_to_iv(
-                quantile_to_call_prices(bs_base["Q"], grid, forward, T, config.risk_free_rate or 0.045, strikes),
-                forward, strikes, T, config.risk_free_rate or 0.045,
-            )
-        iv_prior_fitted = np.clip(iv_prior_fitted, 0.01, 5.0)
+    # ===================================================================
+    # SVI propagation
+    # ===================================================================
+    if smile_model == "svi":
+        from .svi import (svi_iv_at_strikes, fit_svi, filter_quotes_for_fit,
+                          raw_svi_to_jw_normalized, jw_normalized_to_raw_svi)
 
-        if ticker in quotes and ticker in obs_svi_fitted:
-            # OBSERVED: direct SVI fit
-            market_svi = obs_svi_fitted[ticker]
-            iv_marked = svi_iv_at_strikes(market_svi, strikes, q.forward, q.T)
-            iv_marked = np.clip(iv_marked, 0.01, 5.0)
-            iv_marked = np.where(np.isfinite(iv_marked), iv_marked, np.nan)
-            market_jw = obs_jw_fitted.get(ticker)
-            if market_jw is None:
+        def _jw_encode(market_jw, prior_jw):
+            g = np.zeros(5)
+            g[0] = _log_encode(market_jw["v"], prior_jw["v"])
+            g[1] = _ref_encode(market_jw["psi_hat"], prior_jw["psi_hat"])
+            g[2] = _log_encode(market_jw["p_hat"], prior_jw["p_hat"])
+            g[3] = _log_encode(market_jw["c_hat"], prior_jw["c_hat"])
+            g[4] = _log_encode(market_jw["vt_ratio"], prior_jw["vt_ratio"])
+            return g
+
+        def _jw_decode(prior_jw, g, T):
+            v_new = _log_decode(prior_jw["v"], g[0])
+            psi_new = _ref_decode(prior_jw["psi_hat"], g[1])
+            p_new = _log_decode(prior_jw["p_hat"], g[2])
+            c_new = _log_decode(prior_jw["c_hat"], g[3])
+            vtr_new = float(np.clip(_log_decode(prior_jw["vt_ratio"], g[4]), 0.0, 1.0))
+            return jw_normalized_to_raw_svi(v_new, vtr_new, psi_new, p_new, c_new, T)
+
+        N_CH = 5
+        obs_encoded = {}
+        obs_fitted = {}
+        obs_params = {}
+
+        for ticker in tickers:
+            if ticker not in quotes:
+                continue
+            q = quotes[ticker]
+            p = priors[ticker]
+            svi_prior = p.get("_svi_params")
+            filt_k, filt_iv, filt_mask = filter_quotes_for_fit(q.strikes, q.mid_ivs, q.forward)
+            if len(filt_k) >= 5:
+                fit_kw = dict(
+                    bid_ask_spread=q.bid_ask_spread[filt_mask] if q.bid_ask_spread is not None else None,
+                    use_bid_ask_fit=config.use_bid_ask_fit,
+                    lambda_prior=config.lambda_prior,
+                )
+                if svi_prior and config.lambda_prior > 0:
+                    fit_kw["prior_params"] = np.array([svi_prior["a"], svi_prior["b"],
+                                                        svi_prior["rho"], svi_prior["m"],
+                                                        svi_prior["sigma"]])
+                market_svi = fit_svi(filt_k, filt_iv, q.forward, q.T, **fit_kw)
+                obs_fitted[ticker] = market_svi
                 market_jw = raw_svi_to_jw_normalized(
                     market_svi["a"], market_svi["b"], market_svi["rho"],
                     market_svi["m"], market_svi["sigma"], q.T)
-            node_beta = np.array([market_jw["v"], market_jw["psi_hat"], market_jw["p_hat"], market_jw["c_hat"], market_jw["vt_ratio"]])
-        elif ticker in unobs_jw_propagated and svi_params is not None:
-            # UNOBSERVED: decode propagated JW change onto this asset's prior
-            prior_jw = priors[ticker].get("_jw_params")
-            if prior_jw is None:
-                # Compute JW from raw prior SVI
-                prior_jw = raw_svi_to_jw_normalized(
-                    svi_params["a"], svi_params["b"], svi_params["rho"],
-                    svi_params["m"], svi_params["sigma"],
-                    svi_params.get("T", T))
+                obs_params[ticker] = market_jw
+                if svi_prior:
+                    prior_jw = raw_svi_to_jw_normalized(
+                        svi_prior["a"], svi_prior["b"], svi_prior["rho"],
+                        svi_prior["m"], svi_prior["sigma"], svi_prior.get("T", q.T))
+                    p["_jw_params"] = prior_jw
+                    obs_encoded[ticker] = _jw_encode(market_jw, prior_jw)
+                else:
+                    flat_jw = {"v": market_jw["v"], "vt_ratio": 1.0,
+                               "psi_hat": 0.0, "p_hat": 0.5, "c_hat": 0.5}
+                    p["_jw_params"] = flat_jw
+                    obs_encoded[ticker] = _jw_encode(market_jw, flat_jw)
 
-            prop_raw = _jw_decode(prior_jw, unobs_jw_propagated[ticker], T)
-            prop_svi = {**prop_raw, "forward": forward, "T": T}
+        # Propagate
+        unobs_propagated = {}
+        if P is not None and len(parts["unobs_idx"]) > 0 and len(parts["obs_idx"]) > 0:
+            obs_ord = [tickers[i] for i in parts["obs_idx"]]
+            unobs_ord = [tickers[i] for i in parts["unobs_idx"]]
+            g_O = np.zeros((len(obs_ord), N_CH))
+            for j, t in enumerate(obs_ord):
+                if t in obs_encoded:
+                    g_O[j] = obs_encoded[t]
+            g_U = P @ g_O
+            for i, t in enumerate(unobs_ord):
+                unobs_propagated[t] = g_U[i]
 
-            iv_marked = svi_iv_at_strikes(prop_svi, strikes, forward, T)
-            iv_marked = np.clip(iv_marked, 0.01, 5.0)
-            iv_marked = np.where(np.isfinite(iv_marked), iv_marked, np.nan)
-            # Compute JW from the propagated raw SVI
-            prop_jw = raw_svi_to_jw_normalized(
-                prop_raw["a"], prop_raw["b"], prop_raw["rho"],
-                prop_raw["m"], prop_raw["sigma"], T)
-            node_beta = np.array([prop_jw["v"], prop_jw["psi_hat"], prop_jw["p_hat"], prop_jw["c_hat"], prop_jw["vt_ratio"]])
-        else:
-            # No propagation data: show prior
-            iv_marked = iv_prior_fitted.copy()
-            jw = priors[ticker].get("_jw_params")
-            if jw:
-                node_beta = np.array([jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]])
-            elif svi_params:
-                fb_jw = raw_svi_to_jw_normalized(svi_params["a"], svi_params["b"], svi_params["rho"], svi_params["m"], svi_params["sigma"], svi_params.get("T", T))
-                node_beta = np.array([fb_jw["v"], fb_jw["psi_hat"], fb_jw["p_hat"], fb_jw["c_hat"], fb_jw["vt_ratio"]])
+        # Build display smiles
+        nodes = {}
+        for v_idx, ticker in enumerate(tickers):
+            q = quotes.get(ticker)
+            p = priors[ticker]
+            bs_base = p.get("_bs_base", p)
+            svi_params = p.get("_svi_params")
+            strikes, forward, T = _display_strikes(ticker)
+
+            if svi_params is not None:
+                iv_prior_fitted = svi_iv_at_strikes(svi_params, strikes, forward, T)
             else:
-                node_beta = np.array([0.04, 0.0, 0.5, 0.5, 1.0])
+                iv_prior_fitted = call_price_to_iv(
+                    quantile_to_call_prices(bs_base["Q"], grid, forward, T, config.risk_free_rate or 0.045, strikes),
+                    forward, strikes, T, config.risk_free_rate or 0.045)
+            iv_prior_fitted = np.clip(iv_prior_fitted, 0.01, 5.0)
 
-        # Distance
-        valid = np.isfinite(iv_marked) & np.isfinite(iv_prior_fitted)
-        w2_dist = float(np.sqrt(np.mean((iv_marked[valid] - iv_prior_fitted[valid]) ** 2))) if valid.sum() > 0 else 0.0
+            if ticker in quotes and ticker in obs_fitted:
+                market_svi = obs_fitted[ticker]
+                iv_marked = svi_iv_at_strikes(market_svi, strikes, q.forward, q.T)
+                iv_marked = np.clip(iv_marked, 0.01, 5.0)
+                iv_marked = np.where(np.isfinite(iv_marked), iv_marked, np.nan)
+                mj = obs_params.get(ticker)
+                if mj is None:
+                    mj = raw_svi_to_jw_normalized(market_svi["a"], market_svi["b"], market_svi["rho"],
+                                                   market_svi["m"], market_svi["sigma"], q.T)
+                node_beta = np.array([mj["v"], mj["psi_hat"], mj["p_hat"], mj["c_hat"], mj["vt_ratio"]])
+            elif ticker in unobs_propagated and svi_params is not None:
+                prior_jw = priors[ticker].get("_jw_params")
+                if prior_jw is None:
+                    prior_jw = raw_svi_to_jw_normalized(
+                        svi_params["a"], svi_params["b"], svi_params["rho"],
+                        svi_params["m"], svi_params["sigma"], svi_params.get("T", T))
+                prop_raw = _jw_decode(prior_jw, unobs_propagated[ticker], T)
+                prop_svi = {**prop_raw, "forward": forward, "T": T}
+                iv_marked = svi_iv_at_strikes(prop_svi, strikes, forward, T)
+                iv_marked = np.clip(iv_marked, 0.01, 5.0)
+                iv_marked = np.where(np.isfinite(iv_marked), iv_marked, np.nan)
+                pj = raw_svi_to_jw_normalized(prop_raw["a"], prop_raw["b"], prop_raw["rho"],
+                                               prop_raw["m"], prop_raw["sigma"], T)
+                node_beta = np.array([pj["v"], pj["psi_hat"], pj["p_hat"], pj["c_hat"], pj["vt_ratio"]])
+            else:
+                iv_marked = iv_prior_fitted.copy()
+                jw = priors[ticker].get("_jw_params")
+                if jw:
+                    node_beta = np.array([jw["v"], jw["psi_hat"], jw["p_hat"], jw["c_hat"], jw["vt_ratio"]])
+                elif svi_params:
+                    fj = raw_svi_to_jw_normalized(svi_params["a"], svi_params["b"], svi_params["rho"],
+                                                   svi_params["m"], svi_params["sigma"], svi_params.get("T", T))
+                    node_beta = np.array([fj["v"], fj["psi_hat"], fj["p_hat"], fj["c_hat"], fj["vt_ratio"]])
+                else:
+                    node_beta = np.array([0.04, 0.0, 0.5, 0.5, 1.0])
 
-        nodes[ticker] = NodeResult(
-            ticker=ticker,
-            strikes=strikes,
-            iv_prior=iv_prior_fitted,
-            iv_marked=iv_marked,
-            beta=node_beta,
-            is_observed=(ticker in quotes),
-            shock_vector=y_blocks.get(v_idx),
-            wasserstein_dist=w2_dist,
-            Q_prior=p["Q"],
-            Q_marked=p["Q"],
-        )
+            valid = np.isfinite(iv_marked) & np.isfinite(iv_prior_fitted)
+            w2_dist = float(np.sqrt(np.mean((iv_marked[valid] - iv_prior_fitted[valid]) ** 2))) if valid.sum() > 0 else 0.0
+            nodes[ticker] = NodeResult(
+                ticker=ticker, strikes=strikes, iv_prior=iv_prior_fitted,
+                iv_marked=iv_marked, beta=node_beta, is_observed=(ticker in quotes),
+                shock_vector=y_blocks.get(v_idx), wasserstein_dist=w2_dist,
+                Q_prior=p["Q"], Q_marked=p["Q"])
+
+    # ===================================================================
+    # LQD propagation (native)
+    # ===================================================================
+    elif smile_model == "lqd":
+        from .lqd_model import fit_lqd_model, lqd_iv_at_strikes
+        from .svi import fit_svi, filter_quotes_for_fit, svi_iv_at_strikes
+
+        N_CH = 6
+        obs_encoded = {}
+        obs_fitted = {}   # ticker -> lqd result dict
+        obs_params = {}   # ticker -> theta array
+
+        for ticker in tickers:
+            if ticker not in quotes:
+                continue
+            q = quotes[ticker]
+            p = priors[ticker]
+            prior_theta = p.get("_lqd_theta")
+
+            filt_k, filt_iv, filt_mask = filter_quotes_for_fit(q.strikes, q.mid_ivs, q.forward)
+            if len(filt_k) >= 5:
+                pt = np.array(prior_theta) if prior_theta is not None and config.lambda_prior > 0 else None
+                filt_strikes_lqd = q.forward * np.exp(filt_k)
+                lqd_res = fit_lqd_model(filt_strikes_lqd, filt_iv, q.forward, q.T,
+                                         bid_ask_spread=q.bid_ask_spread[filt_mask] if q.bid_ask_spread is not None else None,
+                                         use_bid_ask_fit=config.use_bid_ask_fit,
+                                         prior_theta=pt,
+                                         lambda_prior=config.lambda_prior,
+                                         atm_iv=q.atm_iv)
+                obs_fitted[ticker] = lqd_res
+                mkt_theta = lqd_res["theta"]
+                obs_params[ticker] = mkt_theta
+
+                if prior_theta is not None:
+                    pri_arr = np.asarray(prior_theta, dtype=float)
+                else:
+                    pri_arr = np.zeros(6)
+                # LQD encoding: additive delta (linear basis space)
+                obs_encoded[ticker] = np.clip(mkt_theta - pri_arr, -LOG_CAP, LOG_CAP)
+
+        # Propagate
+        unobs_propagated = {}
+        if P is not None and len(parts["unobs_idx"]) > 0 and len(parts["obs_idx"]) > 0:
+            obs_ord = [tickers[i] for i in parts["obs_idx"]]
+            unobs_ord = [tickers[i] for i in parts["unobs_idx"]]
+            g_O = np.zeros((len(obs_ord), N_CH))
+            for j, t in enumerate(obs_ord):
+                if t in obs_encoded:
+                    g_O[j] = obs_encoded[t]
+            g_U = P @ g_O
+            for i, t in enumerate(unobs_ord):
+                unobs_propagated[t] = g_U[i]
+
+        # Build display smiles
+        nodes = {}
+        for v_idx, ticker in enumerate(tickers):
+            q = quotes.get(ticker)
+            p = priors[ticker]
+            bs_base = p.get("_bs_base", p)
+            svi_params = p.get("_svi_params")
+            prior_theta = p.get("_lqd_theta")
+            prior_alpha = p.get("_lqd_alpha")
+            strikes, forward, T = _display_strikes(ticker)
+
+            # Prior IVs from LQD if available, else SVI fallback
+            if prior_theta is not None and prior_alpha is not None:
+                iv_prior_fitted = lqd_iv_at_strikes(np.asarray(prior_theta), strikes, forward, T, prior_alpha)
+            elif svi_params is not None:
+                iv_prior_fitted = svi_iv_at_strikes(svi_params, strikes, forward, T)
+            else:
+                iv_prior_fitted = call_price_to_iv(
+                    quantile_to_call_prices(bs_base["Q"], grid, forward, T, config.risk_free_rate or 0.045, strikes),
+                    forward, strikes, T, config.risk_free_rate or 0.045)
+            iv_prior_fitted = np.clip(iv_prior_fitted, 0.01, 5.0)
+
+            if ticker in quotes and ticker in obs_fitted:
+                lqd_res = obs_fitted[ticker]
+                iv_marked = lqd_iv_at_strikes(lqd_res["theta"], strikes, forward, T, lqd_res["alpha"])
+                iv_marked = np.clip(np.where(np.isfinite(iv_marked), iv_marked, q.atm_iv), 0.01, 5.0)
+                node_beta = lqd_res["theta"].copy()
+            elif ticker in unobs_propagated:
+                pri_arr = np.asarray(prior_theta if prior_theta is not None else np.zeros(6), dtype=float)
+                prop_theta = pri_arr + np.clip(unobs_propagated[ticker], -LOG_CAP, LOG_CAP)
+                alpha = prior_alpha if prior_alpha else (q.atm_iv if q else 0.25) * np.sqrt(max(T, 1e-8))
+                iv_marked = lqd_iv_at_strikes(prop_theta, strikes, forward, T, alpha)
+                iv_marked = np.clip(np.where(np.isfinite(iv_marked), iv_marked, 0.25), 0.01, 5.0)
+                node_beta = prop_theta
+            else:
+                iv_marked = iv_prior_fitted.copy()
+                node_beta = np.asarray(prior_theta if prior_theta is not None else np.zeros(6), dtype=float)
+
+            valid = np.isfinite(iv_marked) & np.isfinite(iv_prior_fitted)
+            w2_dist = float(np.sqrt(np.mean((iv_marked[valid] - iv_prior_fitted[valid]) ** 2))) if valid.sum() > 0 else 0.0
+            nodes[ticker] = NodeResult(
+                ticker=ticker, strikes=strikes, iv_prior=iv_prior_fitted,
+                iv_marked=iv_marked, beta=node_beta, is_observed=(ticker in quotes),
+                shock_vector=y_blocks.get(v_idx), wasserstein_dist=w2_dist,
+                Q_prior=p["Q"], Q_marked=p["Q"])
+
+    # ===================================================================
+    # Sigmoid propagation (native)
+    # ===================================================================
+    elif smile_model == "sigmoid":
+        from .sigmoid import fit_sigmoid_model, sigmoid_iv_at_strikes
+        from .svi import filter_quotes_for_fit, svi_iv_at_strikes
+
+        N_CH = 6
+        obs_encoded = {}
+        obs_fitted = {}
+        obs_params = {}
+
+        for ticker in tickers:
+            if ticker not in quotes:
+                continue
+            q = quotes[ticker]
+            p = priors[ticker]
+            prior_sig = p.get("_sigmoid_params")
+
+            filt_k, filt_iv, filt_mask = filter_quotes_for_fit(q.strikes, q.mid_ivs, q.forward)
+            if len(filt_k) >= 5:
+                pp = np.array(prior_sig) if prior_sig is not None and config.lambda_prior > 0 else None
+                filt_strikes_sig = q.forward * np.exp(filt_k)
+                sig_res = fit_sigmoid_model(filt_strikes_sig, filt_iv, q.forward, q.T,
+                                             bid_ask_spread=q.bid_ask_spread[filt_mask] if q.bid_ask_spread is not None else None,
+                                             use_bid_ask_fit=config.use_bid_ask_fit,
+                                             prior_params=pp,
+                                             lambda_prior=config.lambda_prior,
+                                             atm_iv=q.atm_iv)
+                obs_fitted[ticker] = sig_res
+                mkt_p = sig_res["params"]
+                obs_params[ticker] = mkt_p
+
+                if prior_sig is not None:
+                    pri = np.asarray(prior_sig, dtype=float)
+                else:
+                    pri = mkt_p.copy()
+
+                # Sigmoid encoding: 6 channels
+                # [0] σ_ATM:  log-ratio (level)
+                # [1] S_ATM:  clamped-reference (signed skew)
+                # [2] K_ATM:  log-ratio (positive)
+                # [3] W_P:    log-ratio (positive)
+                # [4] W_C:    log-ratio (positive)
+                # [5] σ_min:  log-ratio (positive)
+                g = np.zeros(6)
+                g[0] = _log_encode(mkt_p[0], pri[0])
+                g[1] = _ref_encode(mkt_p[1], pri[1])
+                g[2] = _log_encode(mkt_p[2], pri[2])
+                g[3] = _log_encode(mkt_p[3], pri[3])
+                g[4] = _log_encode(mkt_p[4], pri[4])
+                g[5] = _log_encode(mkt_p[5], pri[5])
+                obs_encoded[ticker] = g
+
+        # Propagate
+        unobs_propagated = {}
+        if P is not None and len(parts["unobs_idx"]) > 0 and len(parts["obs_idx"]) > 0:
+            obs_ord = [tickers[i] for i in parts["obs_idx"]]
+            unobs_ord = [tickers[i] for i in parts["unobs_idx"]]
+            g_O = np.zeros((len(obs_ord), N_CH))
+            for j, t in enumerate(obs_ord):
+                if t in obs_encoded:
+                    g_O[j] = obs_encoded[t]
+            g_U = P @ g_O
+            for i, t in enumerate(unobs_ord):
+                unobs_propagated[t] = g_U[i]
+
+        # Build display smiles
+        nodes = {}
+        for v_idx, ticker in enumerate(tickers):
+            q = quotes.get(ticker)
+            p = priors[ticker]
+            bs_base = p.get("_bs_base", p)
+            svi_params = p.get("_svi_params")
+            prior_sig = p.get("_sigmoid_params")
+            prior_sr = p.get("_sigmoid_sigma_ref")
+            strikes, forward, T = _display_strikes(ticker)
+
+            # Prior IVs from Sigmoid if available, else SVI fallback
+            if prior_sig is not None and prior_sr is not None:
+                iv_prior_fitted = sigmoid_iv_at_strikes(np.asarray(prior_sig), strikes, forward, T, prior_sr)
+            elif svi_params is not None:
+                iv_prior_fitted = svi_iv_at_strikes(svi_params, strikes, forward, T)
+            else:
+                iv_prior_fitted = call_price_to_iv(
+                    quantile_to_call_prices(bs_base["Q"], grid, forward, T, config.risk_free_rate or 0.045, strikes),
+                    forward, strikes, T, config.risk_free_rate or 0.045)
+            iv_prior_fitted = np.clip(iv_prior_fitted, 0.01, 5.0)
+
+            if ticker in quotes and ticker in obs_fitted:
+                sig_res = obs_fitted[ticker]
+                sr = sig_res["sigma_ref"]
+                iv_marked = sigmoid_iv_at_strikes(sig_res["params"], strikes, forward, T, sr)
+                iv_marked = np.clip(np.where(np.isfinite(iv_marked), iv_marked, q.atm_iv), 0.01, 5.0)
+                node_beta = sig_res["params"].copy()
+            elif ticker in unobs_propagated:
+                pri = np.asarray(prior_sig if prior_sig is not None else [0.25, 0.0, 0.01, 0.02, 0.02, 0.20], dtype=float)
+                g = unobs_propagated[ticker]
+                # Sigmoid decoding
+                prop = np.zeros(6)
+                prop[0] = _log_decode(pri[0], g[0])            # σ_ATM
+                prop[1] = _ref_decode(pri[1], g[1])             # S_ATM
+                prop[2] = _log_decode(pri[2], g[2])             # K_ATM
+                prop[3] = _log_decode(pri[3], g[3])             # W_P
+                prop[4] = _log_decode(pri[4], g[4])             # W_C
+                prop[5] = _log_decode(pri[5], g[5])             # σ_min
+                # Feasibility clamps
+                prop[0] = max(prop[0], 0.01)
+                prop[2] = max(prop[2], 1e-6)
+                prop[3] = max(prop[3], abs(prop[1]) + 1e-4)
+                prop[4] = max(prop[4], abs(prop[1]) + 1e-4)
+                prop[5] = max(prop[5], 0.005)
+                prop[5] = min(prop[5], prop[0])
+                sr = prior_sr if prior_sr else max(pri[0], 0.01)
+                iv_marked = sigmoid_iv_at_strikes(prop, strikes, forward, T, sr)
+                iv_marked = np.clip(np.where(np.isfinite(iv_marked), iv_marked, 0.25), 0.01, 5.0)
+                node_beta = prop
+            else:
+                iv_marked = iv_prior_fitted.copy()
+                node_beta = np.asarray(prior_sig if prior_sig is not None else [0.25, 0.0, 0.01, 0.02, 0.02, 0.20], dtype=float)
+
+            valid = np.isfinite(iv_marked) & np.isfinite(iv_prior_fitted)
+            w2_dist = float(np.sqrt(np.mean((iv_marked[valid] - iv_prior_fitted[valid]) ** 2))) if valid.sum() > 0 else 0.0
+            nodes[ticker] = NodeResult(
+                ticker=ticker, strikes=strikes, iv_prior=iv_prior_fitted,
+                iv_marked=iv_marked, beta=node_beta, is_observed=(ticker in quotes),
+                shock_vector=y_blocks.get(v_idx), wasserstein_dist=w2_dist,
+                Q_prior=p["Q"], Q_marked=p["Q"])
+
+    else:
+        raise ValueError(f"Unknown smile_model: {smile_model}")
 
     # Compute influence scores
     inf_scores = compute_influence_scores(W)

@@ -36,6 +36,7 @@ function App() {
     fetchUniverse,
     fetchCatalog,
     fetchGraph,
+    restoreQuotes,
     setSelectedNode,
   } = useEngine();
 
@@ -54,7 +55,8 @@ function App() {
     fetchCatalog();
     fetchUniverse();
     fetchGraph();
-  }, [fetchCatalog, fetchUniverse, fetchGraph]);
+    restoreQuotes();
+  }, [fetchCatalog, fetchUniverse, fetchGraph, restoreQuotes]);
 
   useEffect(() => {
     if (selectedNode) setDetailTab("smile");

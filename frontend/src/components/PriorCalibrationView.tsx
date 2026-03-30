@@ -5,6 +5,8 @@ import DistributionTripleView from "./DistributionTripleView";
 import SviSliders from "./SviSliders";
 import LqdSliders from "./LqdSliders";
 import type { LqdTraderParams } from "./LqdSliders";
+import SigmoidSliders from "./SigmoidSliders";
+import type { SigmoidTraderParams } from "./SigmoidSliders";
 import Plot from "./Plot";
 import type { DistributionView } from "../types";
 
@@ -22,6 +24,8 @@ export default function PriorCalibrationView() {
   const [baseSviParams, setBaseSviParams] = useState<{ v: number; psi_hat: number; p_hat: number; c_hat: number; vt_ratio: number } | null>(null);
   const [lqdParams, setLqdParams] = useState<LqdTraderParams | null>(null);
   const [baseLqdParams, setBaseLqdParams] = useState<LqdTraderParams | null>(null);
+  const [sigmoidParams, setSigmoidParams] = useState<SigmoidTraderParams | null>(null);
+  const [baseSigmoidParams, setBaseSigmoidParams] = useState<SigmoidTraderParams | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("smile");
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
 
@@ -49,6 +53,8 @@ export default function PriorCalibrationView() {
     const b = view.beta;
     if (smileModel === "lqd" && b && b.length >= 6) {
       setLqdParams({ min_iv: b[0], atm_skew: b[1], atm_curv: b[2], put_slope: b[3], call_slope: b[4], shoulder: b[5] });
+    } else if (smileModel === "sigmoid" && b && b.length >= 6) {
+      setSigmoidParams({ sigma_atm: b[0], s_atm: b[1], k_atm: b[2], w_p: b[3], w_c: b[4], sigma_min: b[5] });
     } else if (b && b.length >= 5) {
       setSviParams({ v: b[0], psi_hat: b[1], p_hat: b[2], c_hat: b[3], vt_ratio: b[4] });
     }
@@ -62,6 +68,10 @@ export default function PriorCalibrationView() {
       const lp: LqdTraderParams = { min_iv: b[0], atm_skew: b[1], atm_curv: b[2], put_slope: b[3], call_slope: b[4], shoulder: b[5] };
       setLqdParams(lp);
       setBaseLqdParams(lp);
+    } else if (smileModel === "sigmoid" && b && b.length >= 6) {
+      const sp: SigmoidTraderParams = { sigma_atm: b[0], s_atm: b[1], k_atm: b[2], w_p: b[3], w_c: b[4], sigma_min: b[5] };
+      setSigmoidParams(sp);
+      setBaseSigmoidParams(sp);
     } else if (b && b.length >= 5) {
       const p = { v: b[0], psi_hat: b[1], p_hat: b[2], c_hat: b[3], vt_ratio: b[4] };
       setSviParams(p);
@@ -111,6 +121,10 @@ export default function PriorCalibrationView() {
         const lp: LqdTraderParams = { min_iv: b[0], atm_skew: b[1], atm_curv: b[2], put_slope: b[3], call_slope: b[4], shoulder: b[5] };
         setLqdParams(lp);
         setBaseLqdParams(lp);
+      } else if (smileModel === "sigmoid" && b && b.length >= 6) {
+        const sp: SigmoidTraderParams = { sigma_atm: b[0], s_atm: b[1], k_atm: b[2], w_p: b[3], w_c: b[4], sigma_min: b[5] };
+        setSigmoidParams(sp);
+        setBaseSigmoidParams(sp);
       } else if (b && b.length >= 5) {
         const p = { v: b[0], psi_hat: b[1], p_hat: b[2], c_hat: b[3], vt_ratio: b[4] };
         setSviParams(p);
@@ -171,6 +185,30 @@ export default function PriorCalibrationView() {
       setCurrentView(view);
     }).catch(() => {});
   }, [ticker, baseLqdParams]);
+
+  // Sigmoid parameter override handlers
+  const handleSigmoidChange = useCallback(
+    (params: SigmoidTraderParams) => {
+      if (!ticker) return;
+      setSigmoidParams(params);
+      const p = [params.sigma_atm, params.s_atm, params.k_atm,
+                 params.w_p, params.w_c, params.sigma_min];
+      api.sigmoidOverridePrior(ticker, p).then((view) => {
+        setCurrentView(view);
+      }).catch(() => {});
+    },
+    [ticker]
+  );
+
+  const handleSigmoidReset = useCallback(() => {
+    if (!ticker || !baseSigmoidParams) return;
+    setSigmoidParams(baseSigmoidParams);
+    const p = [baseSigmoidParams.sigma_atm, baseSigmoidParams.s_atm, baseSigmoidParams.k_atm,
+               baseSigmoidParams.w_p, baseSigmoidParams.w_c, baseSigmoidParams.sigma_min];
+    api.sigmoidOverridePrior(ticker, p).then((view) => {
+      setCurrentView(view);
+    }).catch(() => {});
+  }, [ticker, baseSigmoidParams]);
 
   const handleResetExclusions = useCallback(() => {
     if (!ticker) return;
@@ -485,6 +523,19 @@ export default function PriorCalibrationView() {
             baseValues={baseSviParams ?? undefined}
             onChange={handleSviChange}
             onReset={handleSviReset}
+          />
+        </div>
+      )}
+      {sigmoidParams && smileModel === "sigmoid" && (
+        <div style={{ padding: "0 16px", borderTop: "1px solid #334155", marginTop: 4, paddingTop: 8 }}>
+          <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
+            Sigmoid Parameters
+          </div>
+          <SigmoidSliders
+            values={sigmoidParams}
+            baseValues={baseSigmoidParams ?? undefined}
+            onChange={handleSigmoidChange}
+            onReset={handleSigmoidReset}
           />
         </div>
       )}
